@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -76,6 +76,19 @@ class QuantitativeDataset:
             Adjust the field of view (FOV) of the dataset, with optional crop or padding
         `resize_matrix(new_im_size, ...)` -> None
             Resize the image matrix to the new size, using specified resizing methods.
+        `transpose(dims)` -> None
+            Transpose the spatial dimensions of the dataset.
+        `flip(dims)` -> None
+            Apply flips on desired dimensions to all items in the dataset.
+        `set_slice(spatial_slice)` -> None
+            Create a slice on the dataset along the specified dimensions.
+            Useful for sub-selecting slices for 3D datasets.
+        `get_maps()` -> Dict[str, torch.Tensor]
+            Return a dictionary of all available maps in the dataset.
+        `get_coords()` -> torch.Tensor
+            Return the coordinates tensor of the dataset.
+        `get_fov()` -> torch.Tensor
+            Return the field of view tensor of the dataset.
         """
 
         self.fov = fov
@@ -114,9 +127,22 @@ class QuantitativeDataset:
         if self.mps is not None:
             self.Nc = self.mps.shape[0]
 
-        self.coords = self.update_coordinates()
+        # for retrieving spatial subset of data
+        self.spatial_slice = None
 
-    def update_coordinates(self, iso: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.coords = self._update_coordinates()
+
+    def __validate_tensor(self, x, name):
+        if x is not None:
+            assert (
+                x.shape[-self.ndim :] == self.im_size
+            ), f"Shape mismatch for {name}: expected {self.im_size}, got {x.shape[-self.ndim:]}"
+            if isinstance(x, np.ndarray):
+                x = torch.from_numpy(x)
+            x = x.to(self.device)
+        return x
+
+    def _update_coordinates(self, iso: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Form a (*im_size, 3) tensor containing 3D coordinates of each voxel in image.
         """
@@ -150,36 +176,31 @@ class QuantitativeDataset:
         # update attributes
         self.coords = coords
 
+        if self.spatial_slice is not None:
+            coords = coords[(*self.spatial_slice, slice(None))]
+
         return coords
 
     def _evaluate_baseline_signal(self, TR: Optional[float] = None) -> torch.Tensor:
-        x = self.PD[
-            None,
-        ]
+        if self.spatial_slice is not None:
+            slc = (None,) + self.spatial_slice
+        else:
+            slc = (None,)
+
+        x = self.PD[slc]
         if self.T1 is not None and TR is not None:
-            x = x * (
-                1
-                - torch.exp(
-                    -TR
-                    / self.T1[
-                        None,
-                    ]
-                )
-            )
+            x = x * (1 - torch.exp(-TR / self.T1[slc]))
         return x
 
     def _apply_b0(self, x: torch.Tensor, tt: torch.Tensor) -> torch.Tensor:
+        if self.spatial_slice is not None:
+            slc = (None,) + self.spatial_slice
+        else:
+            slc = (None,)
+
         if self.B0 is not None:
             x = x.to(torch.complex64)
-            x = x * torch.exp(
-                -1j
-                * 2
-                * torch.pi
-                * self.B0[
-                    None,
-                ]
-                * tt
-            )
+            x = x * torch.exp(-1j * 2 * torch.pi * self.B0[slc] * tt)
         return x
 
     def _evaluate_gre(
@@ -199,17 +220,17 @@ class QuantitativeDataset:
         """
         assert self.T2s is not None, "T2s must be provided to evaluate GRE signal."
 
+        if self.spatial_slice is not None:
+            slc = (None,) + self.spatial_slice
+        else:
+            slc = (None,)
+
         # add broadcase dims
-        for i in range(self.ndim):
+        for _ in range(self.ndim):
             tt = tt[..., None]
 
         x = self._evaluate_baseline_signal(TR)
-        x = x * torch.exp(
-            -tt
-            / self.T2s[
-                None,
-            ]
-        ).to(x.dtype)
+        x = x * torch.exp(-tt / self.T2s[slc]).to(x.dtype)
         x = self._apply_b0(x, tt)
         return x
 
@@ -233,7 +254,12 @@ class QuantitativeDataset:
         assert self.T2 is not None, "T2 must be provided to evaluate SE signal."
         assert self.T2s is not None, "T2s must be provided to evaluate SE signal."
 
-        T2pinv = 1 / (self.T2s + self.eps) - 1 / (self.T2 + self.eps)
+        if self.spatial_slice is not None:
+            slc = (None,) + self.spatial_slice
+        else:
+            slc = (None,)
+
+        T2pinv = 1 / (self.T2s[slc] + self.eps) - 1 / (self.T2[slc] + self.eps)
 
         x = self._evaluate_baseline_signal(TR)
 
@@ -252,28 +278,14 @@ class QuantitativeDataset:
             tt = tt[..., None]
 
         if gre_inds.any():
-            x[gre_inds] = x[gre_inds] * torch.exp(
-                -tt[gre_inds]
-                / self.T2s[
-                    None,
-                ]
-            ).to(x.dtype)
+            x[gre_inds] = x[gre_inds] * torch.exp(-tt[gre_inds] / self.T2s[slc]).to(
+                x.dtype
+            )
             x[gre_inds] = self._apply_b0(x[gre_inds], tt[gre_inds])
         if se_inds.any():
             tt_se = tt[se_inds]
             x[se_inds] = x[se_inds] * torch.exp(
-                -(
-                    (tt_se - TE).abs()
-                    * T2pinv[
-                        None,
-                    ]
-                )
-                - (
-                    tt_se
-                    / self.T2[
-                        None,
-                    ]
-                )
+                -((tt_se - TE).abs() * T2pinv) - (tt_se / self.T2[slc])
             ).to(x.dtype)
             x[se_inds] = self._apply_b0(x[se_inds], tt_se - TE)
 
@@ -329,23 +341,30 @@ class QuantitativeDataset:
 
         if apply_mask:
             assert self.mask is not None, "mask must be provided to apply mask."
-            x = (
-                x
-                * self.mask[
-                    None,
-                ]
-            )
+            if self.spatial_slice is not None:
+                slc = (None,) + self.spatial_slice
+            else:
+                slc = (None,)
+            x = x * self.mask[slc]
 
         if apply_maps:
             assert (
                 self.mps is not None
             ), "sensitivity maps must be provided to apply maps."
-            x = (
-                x[:, None]
-                * self.mps[
-                    None,
-                ]
-            )
+            if self.spatial_slice is not None:
+                slc = (
+                    (None,)
+                    + (
+                        slice(
+                            None,
+                        ),
+                    )
+                    + self.spatial_slice
+                )
+            else:
+                slc = (None,)
+
+            x = x[:, None] * self.mps[slc]
 
         if float_input:
             x = x.squeeze(0)
@@ -371,8 +390,14 @@ class QuantitativeDataset:
         window : Optional[WINDOW_METHODS]
             Method to use for windowing the dataset during resizing, defaults to None.
         """
+
+        if self.spatial_slice is not None:
+            raise ValueError(
+                "Cannot resize matrix with a spatial slice set. Clear the slice first."
+            )
+
         self.im_size = new_im_size
-        self.coords = self.update_coordinates()
+        self.coords = self._update_coordinates()
 
         def resize_wrapper(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if x is not None:
@@ -413,6 +438,8 @@ class QuantitativeDataset:
             than current fov. If None, the crop defaults to the center of the current fov.
             If provided and corner=-1 for any dimension, that dimension will remain center cropped.
         """
+
+        assert self.spatial_slice is None, "Cannot resize FOV with a spatial slice set."
 
         if not isinstance(new_fov, torch.Tensor):
             new_fov = torch.tensor(new_fov, device=self.device, dtype=torch.float32)
@@ -483,17 +510,229 @@ class QuantitativeDataset:
         # update fov and coords
         self.fov = new_fov
         self.im_size = new_im_size
-        self.coords = self.update_coordinates(iso=new_iso)
+        self.coords = self._update_coordinates(iso=new_iso)
 
-    def __validate_tensor(self, x, name):
-        if x is not None:
+    def transpose(self, dims: Tuple[int, ...]) -> None:
+        """
+        Tranpose the spatial dimensions of dataset.
+
+        Parameters
+        ----------
+        dims : Tuple[int, ...]
+            Desired permutation of spatial dimensions. Must have same number of dimensions as fov.
+
+        """
+
+        assert (
+            len(dims) == self.ndim
+        ), "dims must have the same number of dimensions as fov."
+
+        def transpose_wrapper(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if x is not None:
+                if x.ndim == self.ndim:
+                    return x.permute(dims)
+                elif x.ndim > self.ndim:
+                    ndim_ofs = x.ndim - self.ndim
+                    leading_dims = list(range(ndim_ofs))
+                    return x.permute((*leading_dims, *[d + ndim_ofs for d in dims]))
+                else:
+                    raise ValueError(f"Cannot transpose tensor with shape {x.shape}.")
+            return None
+
+        self.PD = transpose_wrapper(self.PD)
+        self.T2s = transpose_wrapper(self.T2s)
+        self.T2 = transpose_wrapper(self.T2)
+        self.T1 = transpose_wrapper(self.T1)
+        self.B1 = transpose_wrapper(self.B1)
+        self.B0 = transpose_wrapper(self.B0)
+        self.mps = transpose_wrapper(self.mps)
+        self.mask = transpose_wrapper(self.mask)
+
+        # update spatial tracking
+        self.im_size = tuple(self.im_size[d] for d in dims)
+        self.fov = torch.tensor(
+            tuple(self.fov[d].item() for d in dims),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if self.ndim == 2:
+            if dims == (1, 0):
+                self.iso = torch.tensor(
+                    [self.iso[1].item(), self.iso[0].item(), self.iso[2].item()],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+        else:
+            self.iso = torch.tensor(
+                [self.iso[d].item() for d in dims],
+                device=self.device,
+                dtype=torch.float32,
+            )
+        self.coords = self._update_coordinates()
+
+    def flip(self, dims: Tuple[int, ...]) -> None:
+        """
+        Apply flips on desired dimensions to all items in dataset
+
+        Parameters
+        ----------
+        dims : Tuple[int, ...]
+            Dimensions to flip. Can be negative to indicate from the end.
+        """
+
+        def flip_wrapper(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if x is not None:
+                nofs = x.ndim - self.ndim
+                for d in dims:
+                    if d < 0:
+                        x = torch.flip(x, dims=(d,))
+                    else:
+                        x = torch.flip(x, dims=(d + nofs,))
+                return x.contiguous()
+            return x
+
+        self.PD = flip_wrapper(self.PD)
+        self.T2s = flip_wrapper(self.T2s)
+        self.T2 = flip_wrapper(self.T2)
+        self.T1 = flip_wrapper(self.T1)
+        self.B1 = flip_wrapper(self.B1)
+        self.B0 = flip_wrapper(self.B0)
+        self.mps = flip_wrapper(self.mps)
+        self.mask = flip_wrapper(self.mask)
+        self.coords = self._update_coordinates()
+
+    def set_slice(self, spatial_slice: Optional[Tuple[slice, ...]]) -> None:
+        """
+        Create a slice on the dataset along the specified dimensions.
+
+        Parameters
+        ----------
+        slices : Tuple[slice, ...]
+            Slices to apply to each dimension of the dataset.
+        """
+
+        if spatial_slice is not None:
+            # assert tuple with length same as ndim
             assert (
-                x.shape[-self.ndim :] == self.im_size
-            ), f"Shape mismatch for {name}: expected {self.im_size}, got {x.shape[-self.ndim:]}"
-            if isinstance(x, np.ndarray):
-                x = torch.from_numpy(x)
-            x = x.to(self.device)
-        return x
+                len(spatial_slice) == self.ndim
+            ), "spatial_slice must have the same number of dimensions as fov."
+            assert isinstance(spatial_slice, tuple), "spatial_slice must be a tuple."
+            for s in spatial_slice:
+                assert isinstance(
+                    s, (slice, list)
+                ), "spatial_slice must contain slices."
+        self.spatial_slice = spatial_slice
+        self._update_coordinates()
+
+    def get_maps(
+        self, return_maps: Optional[Sequence[str]] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Return a dictionary of all available maps in the dataset.
+        """
+        maps = {}
+        if self.PD is not None and (return_maps is None or "PD" in return_maps):
+            if self.spatial_slice is not None:
+                maps["PD"] = self.PD[self.spatial_slice].clone()
+            else:
+                maps["PD"] = self.PD.clone()
+        if self.T2s is not None and (return_maps is None or "T2s" in return_maps):
+            if self.spatial_slice is not None:
+                maps["T2s"] = self.T2s[self.spatial_slice].clone()
+            else:
+                maps["T2s"] = self.T2s.clone()
+        if self.T2 is not None and (return_maps is None or "T2" in return_maps):
+            if self.spatial_slice is not None:
+                maps["T2"] = self.T2[self.spatial_slice].clone()
+            else:
+                maps["T2"] = self.T2.clone()
+        if self.T1 is not None and (return_maps is None or "T1" in return_maps):
+            if self.spatial_slice is not None:
+                maps["T1"] = self.T1[self.spatial_slice].clone()
+            else:
+                maps["T1"] = self.T1.clone()
+        if self.B1 is not None and (return_maps is None or "B1" in return_maps):
+            if self.spatial_slice is not None:
+                maps["B1"] = self.B1[self.spatial_slice].clone()
+            else:
+                maps["B1"] = self.B1.clone()
+        if self.B0 is not None and (return_maps is None or "B0" in return_maps):
+            if self.spatial_slice is not None:
+                maps["B0"] = self.B0[self.spatial_slice].clone()
+            else:
+                maps["B0"] = self.B0.clone()
+        if self.mps is not None and (return_maps is None or "mps" in return_maps):
+            if self.spatial_slice is not None:
+                maps["mps"] = self.mps[(slice(None),) + self.spatial_slice].clone()
+            else:
+                maps["mps"] = self.mps.clone()
+        if self.mask is not None and (return_maps is None or "mask" in return_maps):
+            if self.spatial_slice is not None:
+                maps["mask"] = self.mask[self.spatial_slice].clone()
+            else:
+                maps["mask"] = self.mask.clone()
+
+        return maps
+
+    def get_coords(self) -> torch.Tensor:
+        """
+        Return the coordinates tensor of the dataset.
+        """
+        if self.spatial_slice is not None:
+            return self.coords[self.spatial_slice + (slice(None),)].clone()
+        return self.coords.clone()
+
+    def get_fov(self) -> torch.Tensor:
+        """
+        Return the field of view tensor of the dataset.
+        """
+        fov_out = self.fov.clone()
+        if self.spatial_slice is not None:
+            for d in range(self.ndim):
+                if isinstance(self.spatial_slice[d], slice):
+                    start = self.spatial_slice[d].start or 0
+                    stop = self.spatial_slice[d].stop or self.im_size[d]
+                    fov_out[d] = self.fov[d] * (stop - start) / self.im_size[d]
+                elif isinstance(self.spatial_slice[d], list):
+                    inds = np.array(self.spatial_slice[d])
+                    width = inds.max() - inds.min() + 1
+                    fov_out[d] = self.fov[d] * width / self.im_size[d]
+        return fov_out
+
+    def to(self, device: torch.DeviceObjType):
+        """
+        Move the dataset to a specified device.
+
+        Parameters
+        ----------
+        device : torch.DeviceObjType
+            The device to move the dataset to.
+
+        Returns
+        -------
+        QuantitativeDataset
+            A new instance of QuantitativeDataset on the specified device.
+        """
+
+        def to_wrapper(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if x is not None:
+                return x.to(device)
+            return None
+
+        self.PD = to_wrapper(self.PD)
+        self.T2s = to_wrapper(self.T2s)
+        self.T2 = to_wrapper(self.T2)
+        self.T1 = to_wrapper(self.T1)
+        self.B1 = to_wrapper(self.B1)
+        self.B0 = to_wrapper(self.B0)
+        self.mps = to_wrapper(self.mps)
+        self.mask = to_wrapper(self.mask)
+        self.fov = self.fov.to(device)
+        self.iso = self.iso.to(device)
+        self.coords = self.coords.to(device)
+        self.device = device
+
+        return self
 
 
 class SimDataset(Enum):

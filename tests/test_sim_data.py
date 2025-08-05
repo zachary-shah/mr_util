@@ -203,3 +203,122 @@ def test_dataset_resize_ops():
         *new_size,
         3,
     ), f"Coords shape mismatch after resize: expected {(*new_size, 3)}, got {data.coords.shape}"
+
+
+def test_dataset_evaluate():
+    if TEST_CUDA:
+        device_idx = TEST_DEVICE_IDX
+        device = torch.device(device_idx)
+    else:
+        device = torch.device("cpu")
+    set_sim_data_dir("~/data/")
+
+    data = load_dataset(
+        dataset=SimDataset.HEAD_3D,
+        device=device,
+        verbose=True,
+        filters=DatasetFilterConfig(
+            pd_cfg=MapFilterConfig(clip_min=0.0),
+            t2s_cfg=MapFilterConfig(
+                clip_min=0.02, clip_max=0.3, gaussian_std=0.05, median_filter_size=3
+            ),
+            t2_cfg=MapFilterConfig(clip_min=0.0, clip_max=1, gaussian_std=0.01),
+            t1_cfg=MapFilterConfig(clip_min=0.0, clip_max=10, gaussian_std=0.01),
+            b0_cfg=MapFilterConfig(
+                clip_min=-200, clip_max=200, gaussian_std=0.25, median_filter_size=3
+            ),
+        ),
+    )
+    # reduce slices
+    z_inds = [22, 44, 66, 88, 110]
+    data.set_slice((slice(None), slice(None), z_inds))
+
+    # spin echo
+    tt = torch.linspace(0.5, 50, 30).to(device).to(torch.float32) / 1000
+    TE = 30 / 1000
+    TR = 5
+    data.evaluate(tt + TE, signal_type="se", TE=TE, TR=TR)
+    data.evaluate(tt + TE, signal_type="se", TE=TE, TR=None)
+    data.evaluate(tt + TE, signal_type="se", TE=TE, TR=TR, apply_maps=True)
+    data.evaluate(tt + TE, signal_type="se", TE=TE, TR=TR, apply_mask=True)
+    data.evaluate(
+        tt + TE, signal_type="se", TE=TE, TR=TR, apply_mask=True, apply_maps=True
+    )
+
+    # gradient echo
+    data.evaluate(tt, signal_type="gre", TE=TE, TR=TR)
+    data.evaluate(tt, signal_type="gre", TE=TE, TR=None)
+    data.evaluate(tt, signal_type="gre", TE=TE, TR=TR, apply_maps=True)
+    data.evaluate(tt, signal_type="gre", TE=TE, TR=TR, apply_mask=True)
+    data.evaluate(tt, signal_type="gre", TE=TE, TR=TR, apply_mask=True, apply_maps=True)
+
+
+def test_dataset_coord_ops():
+    if TEST_CUDA:
+        device_idx = TEST_DEVICE_IDX
+        device = torch.device(device_idx)
+    else:
+        device = torch.device("cpu")
+    set_sim_data_dir("~/data/")
+
+    data = load_dataset(
+        dataset=SimDataset.HEAD_3D,
+        device=device,
+        verbose=True,
+        filters=DatasetFilterConfig(
+            pd_cfg=MapFilterConfig(clip_min=0.0),
+            t2s_cfg=MapFilterConfig(
+                clip_min=0.02, clip_max=0.3, gaussian_std=0.05, median_filter_size=3
+            ),
+            t2_cfg=MapFilterConfig(clip_min=0.0, clip_max=1, gaussian_std=0.01),
+            t1_cfg=MapFilterConfig(clip_min=0.0, clip_max=10, gaussian_std=0.01),
+            b0_cfg=MapFilterConfig(
+                clip_min=-200, clip_max=200, gaussian_std=0.25, median_filter_size=3
+            ),
+        ),
+    )
+    data.resize_fov((0.19, 0.22, 0.135), corner=(0, -1, 0.08))
+    data.resize_fov((0.22, 0.22, 0.135))
+    data._update_coordinates(
+        iso=torch.tensor([0.0, 0.0, 0.0], device=device, dtype=torch.float32)
+    )
+    data.transpose(dims=(1, 0, 2))
+    Nc = data.Nc
+
+    # specific slices
+    z_inds = [22, 44, 66, 88, 110]
+    targ_size = (data.im_size[0], data.im_size[1], len(z_inds))
+    data.set_slice((slice(None), slice(None), z_inds))
+    # time-series images
+    tt = torch.linspace(0.5, 50, 30).to(device).to(torch.float32) / 1000
+    Nt = len(tt)
+    TE = 30 / 1000
+    tt = tt + TE
+    x_t = data.evaluate(tt, TR=None, signal_type="se", TE=TE)
+
+    maps = data.get_maps(return_maps=["B0", "mps", "mask"])
+    B0 = maps["B0"]
+    mps = maps["mps"]
+    mask = maps["mask"]
+    coords = data.get_coords()
+    fov = data.get_fov()
+
+    assert (
+        B0.shape == targ_size
+    ), f"B0 shape mismatch: expected {targ_size}, got {B0.shape}"
+    assert mps.shape == (
+        Nc,
+        *targ_size,
+    ), f"MPS shape mismatch: expected {(Nc, *targ_size)}, got {mps.shape}"
+    assert (
+        mask.shape == targ_size
+    ), f"Mask shape mismatch: expected {targ_size}, got {mask.shape}"
+    assert coords.shape == (
+        *targ_size,
+        data.ndim,
+    ), f"Coords shape mismatch: expected {(*targ_size, data.ndim)}, got {coords.shape}"
+    assert x_t.shape == (
+        Nt,
+        *targ_size,
+    ), f"x_t shape mismatch: expected {(Nt, *targ_size)}, got {x_t.shape}"
+    assert fov.shape == (3,), f"FOV shape mismatch: expected (3,), got {fov.shape}"
