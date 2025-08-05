@@ -1,18 +1,19 @@
-import torch
-import numpy as np
-from typing import Literal, Tuple, Optional, Union
-from warnings import warn
 from math import sqrt
+from typing import Literal, Optional, Tuple, Union
+from warnings import warn
+
+import numpy as np
+import torch
+from scipy.ndimage import gaussian_filter, median_filter
 from scipy.signal import windows
-from scipy.ndimage import median_filter, gaussian_filter
 
-SPATIAL_RESIZE_METHODS = Literal['bilinear', 'bicubic', 'nearest']
-RESIZE_METHODS = Literal['bilinear', 'bicubic', 'nearest', 'fourier']
-WINDOW_METHODS = Literal['boxcar', 'hamming', 'hann', 'blackman', 'kaiser']
-DEFAULT_WINDOW = 'hann'
+SPATIAL_RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest"]
+RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest", "fourier"]
+WINDOW_METHODS = Literal["boxcar", "hamming", "hann", "blackman", "kaiser"]
+DEFAULT_WINDOW = "hann"
 
-def resize(input: torch.Tensor, 
-           oshape: Tuple[int, ...]) -> torch.Tensor:
+
+def resize(input: torch.Tensor, oshape: Tuple[int, ...]) -> torch.Tensor:
     """
     Resize with zero-padding or cropping.
 
@@ -26,19 +27,22 @@ def resize(input: torch.Tensor,
         torch.tensor: Zero-padded or cropped result.
     """
 
-    assert len(input.shape) == len(oshape), \
-        "Input and output must have same number of dimensions."
-    
+    assert len(input.shape) == len(
+        oshape
+    ), "Input and output must have same number of dimensions."
+
     ishape = input.shape
 
-    if ishape == oshape: return input
+    if ishape == oshape:
+        return input
 
     ishift = [max(i // 2 - o // 2, 0) for i, o in zip(ishape, oshape)]
     oshift = [max(o // 2 - i // 2, 0) for i, o in zip(ishape, oshape)]
-    
-    copy_shape = [min(i - si, o - so)
-                  for i, si, o, so in zip(ishape, ishift, oshape, oshift)]
-        
+
+    copy_shape = [
+        min(i - si, o - so) for i, si, o, so in zip(ishape, ishift, oshape, oshift)
+    ]
+
     islice = tuple([slice(si, si + c) for si, c in zip(ishift, copy_shape)])
     oslice = tuple([slice(so, so + c) for so, c in zip(oshift, copy_shape)])
 
@@ -48,7 +52,9 @@ def resize(input: torch.Tensor,
     return output
 
 
-def fft(x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True) -> torch.Tensor:
+def fft(
+    x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True
+) -> torch.Tensor:
     """
     Compute the cartesian FFT of image data with shape (..., im_shape)
     with k-space centering support
@@ -83,7 +89,9 @@ def fft(x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True) -> to
     return x
 
 
-def ifft(x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True) -> torch.Tensor:
+def ifft(
+    x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True
+) -> torch.Tensor:
     """
     Compute the inverse cartesian FFT of k-space data with shape (..., im_shape)
     with k-space centering support
@@ -118,9 +126,11 @@ def ifft(x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True) -> t
     return x
 
 
-def nd_windowed_filter(w_shape: Tuple[int, ...], 
-                       window: WINDOW_METHODS = "hann",
-                       oshape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+def nd_windowed_filter(
+    w_shape: Tuple[int, ...],
+    window: WINDOW_METHODS = "hann",
+    oshape: Optional[Tuple[int, ...]] = None,
+) -> torch.Tensor:
     """
     Get n-dimensional windowed fourier filter for data with shape im_shape, where the window is defined by w_shape.
 
@@ -157,7 +167,9 @@ def nd_windowed_filter(w_shape: Tuple[int, ...],
     elif window == "boxcar":
         wfunc = lambda x: windows.boxcar(x)
     else:
-        raise ValueError(f"Unknown window type: {window}. Must be one of {WINDOW_METHODS.__args__}.")
+        raise ValueError(
+            f"Unknown window type: {window}. Must be one of {WINDOW_METHODS.__args__}."
+        )
 
     # form n-d window
     if d == 1:
@@ -213,9 +225,9 @@ def gen_grd(
     return grd.type(torch.float32)
 
 
-def _fourier_resize(x: torch.Tensor, 
-                    new_shape: Tuple[int, ...], 
-                    window: Optional[WINDOW_METHODS] = None) -> torch.Tensor:
+def _fourier_resize(
+    x: torch.Tensor, new_shape: Tuple[int, ...], window: Optional[WINDOW_METHODS] = None
+) -> torch.Tensor:
     """
     Take an image and reshape it to new_shape using fourier padding
 
@@ -232,7 +244,7 @@ def _fourier_resize(x: torch.Tensor,
             - 'hann': hann window
             - 'blackman': blackman window
             - 'kaiser': kaiser window
-    
+
     Returns:
     --------
     x : torch.Tensor
@@ -246,7 +258,7 @@ def _fourier_resize(x: torch.Tensor,
 
     if torch.is_complex(x):
         isComplex = True
-    
+
     ndim = len(new_shape)
     fft_shape = x.shape[-ndim:]
     abs_max = x.abs().max()
@@ -274,9 +286,9 @@ def _fourier_resize(x: torch.Tensor,
 
 
 def _spatial_resize(
-    x: torch.Tensor, 
-    im_size: tuple, 
-    method: SPATIAL_RESIZE_METHODS = 'bilinear',
+    x: torch.Tensor,
+    im_size: tuple,
+    method: SPATIAL_RESIZE_METHODS = "bilinear",
 ) -> torch.Tensor:
     """
     Resize a spatial tensor to a new spatial size.
@@ -300,13 +312,15 @@ def _spatial_resize(
     """
 
     n_spatial = len(im_size)
-    if n_spatial == 3 and method == 'bicubic':
-        warn("Bicubic interpolation is not supported for 3D data, using bilinear instead.")
-        method = 'bilinear'
-    
+    if n_spatial == 3 and method == "bicubic":
+        warn(
+            "Bicubic interpolation is not supported for 3D data, using bilinear instead."
+        )
+        method = "bilinear"
+
     grd = 2 * gen_grd(im_size, balanced=True).to(x.device).flip(-1)
     grd = grd[None].repeat_interleave(x.shape[0], dim=0)
-    
+
     def gs(x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.grid_sample(
             x.unsqueeze(1), grd, align_corners=True, mode=method
@@ -321,9 +335,9 @@ def _spatial_resize(
 
 
 def spatial_resize(
-    x: torch.Tensor, 
-    im_size: tuple, 
-    method: RESIZE_METHODS = 'bilinear',
+    x: torch.Tensor,
+    im_size: tuple,
+    method: RESIZE_METHODS = "bilinear",
     window: Optional[WINDOW_METHODS] = None,
 ) -> torch.Tensor:
     """
@@ -349,11 +363,11 @@ def spatial_resize(
     x : (torch.Tensor)
         The resized tensor with shape (..., *im_size)
     """
-    
+
     inp_im_size = x.shape[-len(im_size) :]
     if inp_im_size == im_size:
         return x
-    
+
     is_np = False
     if isinstance(x, np.ndarray):
         x = torch.from_numpy(x)
@@ -363,23 +377,27 @@ def spatial_resize(
     if x.dtype == torch.bool:
         x = x.to(torch.float32)
         is_bool = True
-    
+
     # reshape to (B, *im_size)
     is_batched = True
     if len(im_size) == x.ndim:
-        x = x[None,]
+        x = x[
+            None,
+        ]
         is_batched = False
     else:
         orig_batch = x.shape[: -len(im_size)]
         orig_im_size = x.shape[-len(im_size) :]
         x = x.reshape((-1, *orig_im_size))
 
-    if method == 'fourier':
+    if method == "fourier":
         x = _fourier_resize(x, im_size, window)
     elif method in SPATIAL_RESIZE_METHODS.__args__:
         x = _spatial_resize(x, im_size, method=method)
     else:
-        raise ValueError(f"Unknown resize method: {method}. Must be one of {RESIZE_METHODS}.")
+        raise ValueError(
+            f"Unknown resize method: {method}. Must be one of {RESIZE_METHODS}."
+        )
 
     if is_batched:
         x = x.reshape((*orig_batch, *im_size))
@@ -388,7 +406,7 @@ def spatial_resize(
 
     if is_bool:
         x = x.to(torch.bool)
-        
+
     if is_np:
         x = x.cpu().numpy()
 
@@ -421,14 +439,14 @@ def spatial_filter(
         The filtered tensor with shape (..., *im_size)
     """
 
-    if (gaussian_filter_size is None and median_filter_size is None):
+    if gaussian_filter_size is None and median_filter_size is None:
         return x
-    
+
     torch_info = None
     if isinstance(x, torch.Tensor):
         torch_info = (x.device, x.dtype)
         x = x.cpu().numpy()
-    
+
     # dims to filter
     filt_dims = tuple(range(-len(im_size), 0))
 
@@ -438,8 +456,10 @@ def spatial_filter(
                 median_filter_size = int(median_filter_size)
             median_filter_size = (median_filter_size,) * len(im_size)
         elif len(median_filter_size) != len(im_size):
-            raise ValueError("median_filter_size must be an int or a tuple of the same length as im_size.")
-       
+            raise ValueError(
+                "median_filter_size must be an int or a tuple of the same length as im_size."
+            )
+
         # filter real/imag seperately if complex
         is_complex = np.iscomplexobj(x)
         if is_complex:
@@ -447,12 +467,14 @@ def spatial_filter(
         x = median_filter(x, size=median_filter_size, axes=filt_dims)
         if is_complex:
             x = x[0] + 1j * x[1]
-        
+
     if gaussian_filter_size is not None:
         if isinstance(gaussian_filter_size, (int, float)):
             gaussian_filter_size = (gaussian_filter_size,) * len(im_size)
         elif len(gaussian_filter_size) != len(im_size):
-            raise ValueError("gaussian_filter_size must be an int or a tuple of the same length as im_size.")
+            raise ValueError(
+                "gaussian_filter_size must be an int or a tuple of the same length as im_size."
+            )
         x = gaussian_filter(x, sigma=gaussian_filter_size, axes=filt_dims)
 
     if torch_info is not None:
@@ -461,8 +483,7 @@ def spatial_filter(
     return x
 
 
-def normalize(shifted: torch.Tensor,
-              target: torch.Tensor) -> torch.Tensor:
+def normalize(shifted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     Normalize the shifted tensor to match the target tensor scale.
     """

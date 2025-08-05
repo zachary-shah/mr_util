@@ -9,7 +9,7 @@ SIM_DATASETS = {
     "Axial_2D": "ax_2d.pt",
 }
 
-# set SIM_DATA_DIR
+
 def set_sim_data_dir(path: str):
     global SIM_DATA_DIR
     SIM_DATA_DIR = Path(path).expanduser()
