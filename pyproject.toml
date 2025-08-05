@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mr_util"
+version = "0.0.1"
+authors = [
+  { name="Zachary Shah" },
+]
+description = "MRI Utils and Simulation Data"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "huggingface_hub",
+]
+
+[tool.hatch.build]
+packages = ["src/mr_util"]

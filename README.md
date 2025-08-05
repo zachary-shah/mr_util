@@ -1,0 +1,3 @@
+## Package that contains tools and simulation data for MRI
+
+Readme to be populated...
