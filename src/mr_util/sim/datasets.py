@@ -8,12 +8,20 @@ import torch
 from huggingface_hub import snapshot_download
 
 from ..sim import paths
-from ..utils import RESIZE_METHODS, WINDOW_METHODS, spatial_filter, spatial_resize
+from ..utils import (
+    RESIZE_METHODS,
+    WINDOW_METHODS,
+    gen_grd,
+    resize,
+    spatial_filter,
+    spatial_resize,
+)
 
 
 class QuantitativeDataset:
     def __init__(
         self,
+        fov: torch.Tensor,
         PD: torch.Tensor,
         T2s: Optional[torch.Tensor] = None,
         T2: Optional[torch.Tensor] = None,
@@ -22,20 +30,77 @@ class QuantitativeDataset:
         B0: Optional[torch.Tensor] = None,
         mps: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        iso: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ):
         """
         Set up a quantitative imaging dataset with the provided tensors.
 
-        Expect all relaxation maps to be in seconds, with B0 in Hz.
+        Parameters
+        ----------
+        fov : torch.Tensor
+            Field of view (FOV) in meters, shape (ndim,).
+        PD : torch.Tensor
+            Proton Density map tensor, shape (*im_size).
+        T2s : Optional[torch.Tensor]
+            T2* map in seconds, shape (*im_size). If None, will not be used
+        T2 : Optional[torch.Tensor]
+            T2 map in seconds, shape (*im_size). If None, will not be used
+        T1 : Optional[torch.Tensor]
+            T1 map in seconds, shape (*im_size). If None, will not be used
+        B1 : Optional[torch.Tensor]
+            B1 map for transmit inhomogeneities. TODO: add support for B1 in acquired model.
+        B0 : Optional[torch.Tensor]
+            B0 map in Hz, shape (*im_size). If None, will not be used
+        mps : Optional[torch.Tensor]
+            Sensitivity maps tensor, shape (Nc, *im_size), where Nc is the number of coils
+        mask : Optional[torch.Tensor]
+            Binary mask tensor, shape (*im_size). If None, will not be used
+        iso : Optional[torch.Tensor]
+            Center position of the FOV in the image, length (3,) in meters.
+            Can be length (2,) for 2D datasets, in which case the third dimension is assumed to be 0.
+        eps : float
+            Small value to avoid division by zero in T2* and T2 calculations. Default is 1e-8.
 
-        TODO: add support for B1 in acquired model
+        Additional Attributes Created
+        -----------------------------
+        coords : torch.Tensor
+            Coordinates tensor of shape (*im_size, ndim) containing the coordinates of each voxel in the
+            image, adjusted by the iso position.
+
+        Relevant Methods
+        ----------------
+        `evaluate(tt, ...)` -> torch.Tensor
+            Evaluate the signal at times `tt` for the specified signal type (GRE or SE).
+        `resize_fov(new_fov, corner=None)` -> None
+            Adjust the field of view (FOV) of the dataset, with optional crop or padding
+        `resize_matrix(new_im_size, ...)` -> None
+            Resize the image matrix to the new size, using specified resizing methods.
         """
+
+        self.fov = fov
+        self.ndim = len(fov)
+        assert self.ndim in [2, 3], "Quantitative Image dimensions must be 2D or 3D."
+
+        if iso is not None:
+            if not isinstance(iso, torch.Tensor):
+                iso = torch.tensor(iso, device=fov.device, dtype=torch.float32)
+            if self.ndim == 2 and len(iso) == 2:
+                iso = torch.tensor(
+                    [iso[0].item(), iso[1].item(), 0.0],
+                    device=fov.device,
+                    dtype=torch.float32,
+                )
+            assert len(iso) == 3, "iso position must be length 3."
+            self.iso = iso.to(self.device).to(torch.float32)
+        else:
+            self.iso = torch.zeros((3,), device=fov.device, dtype=torch.float32)
 
         self.im_size = PD.shape
         self.device = PD.device
-        self.ndim = len(self.im_size)
-        assert self.ndim in [2, 3], "Quantitative Image dimensions must be 2D or 3D."
+        assert (
+            PD.ndim == self.ndim
+        ), "Spatial maps must have the same number of dimensions as fov."
 
         self.PD = PD
         self.T2s = self.__validate_tensor(T2s, "T2s")
@@ -48,6 +113,44 @@ class QuantitativeDataset:
         self.eps = eps
         if self.mps is not None:
             self.Nc = self.mps.shape[0]
+
+        self.coords = self.update_coordinates()
+
+    def update_coordinates(self, iso: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Form a (*im_size, 3) tensor containing 3D coordinates of each voxel in image.
+        """
+
+        fov_ = self.fov.cpu().numpy().tolist()
+        im_size_ = self.im_size
+
+        if self.ndim == 2:
+            fov_ = [fov_[0], fov_[1], 1.0]
+            im_size_ = (im_size_[0], im_size_[1], 1)
+
+        coords = gen_grd(im_size_, fovs=fov_)
+
+        if self.ndim == 2:
+            coords = coords[:, :, 0]
+
+        coords = coords.to(torch.float32).to(self.device)
+
+        # adjust to center position
+        if iso is None:
+            iso = self.iso.clone()
+        assert len(iso) == 3, "provided iso position must be length 3 and in meters."
+        self.iso = iso.clone()
+
+        for _ in range(self.ndim):
+            iso = iso[
+                None,
+            ]
+        coords = coords + iso
+
+        # update attributes
+        self.coords = coords
+
+        return coords
 
     def _evaluate_baseline_signal(self, TR: Optional[float] = None) -> torch.Tensor:
         x = self.PD[
@@ -249,6 +352,139 @@ class QuantitativeDataset:
 
         return x
 
+    def resize_matrix(
+        self,
+        new_im_size: Tuple[int, ...],
+        method: RESIZE_METHODS = "bilinear",
+        window: Optional[WINDOW_METHODS] = None,
+    ) -> None:
+        """
+        Resize the image matrix to the new size. See `mr_util.utils.spatial_resize` for details
+        on resizing methods arguments.
+
+        Parameters
+        ----------
+        new_im_size : Tuple[int, ...]
+            The new image size to set for the dataset.
+        method : RESIZE_METHODS
+            Method to use for resizing the dataset, defaults to "bilinear".
+        window : Optional[WINDOW_METHODS]
+            Method to use for windowing the dataset during resizing, defaults to None.
+        """
+        self.im_size = new_im_size
+        self.coords = self.update_coordinates()
+
+        def resize_wrapper(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if x is not None:
+                return spatial_resize(
+                    x,
+                    new_im_size,
+                    method=method,
+                    window=window,
+                )
+            return None
+
+        self.PD = resize_wrapper(self.PD)
+        self.T2s = resize_wrapper(self.T2s)
+        self.T2 = resize_wrapper(self.T2)
+        self.T1 = resize_wrapper(self.T1)
+        self.B1 = resize_wrapper(self.B1)
+        self.B0 = resize_wrapper(self.B0)
+        self.mps = resize_wrapper(self.mps)
+        self.mask = resize_wrapper(self.mask)
+
+    def resize_fov(
+        self,
+        new_fov: Union[Tuple[float, ...], torch.Tensor],
+        corner: Optional[Union[Tuple[float, ...], torch.Tensor]] = None,
+    ) -> None:
+        """
+        Adjust the field of view (FOV) of the dataset.
+
+        If new_fov is greater than current fov, the dataset will be padded with zeros.
+        Otherwise, the dataset will be cropped to the new fov, with optional anchoring corner.
+
+        Parameters
+        ----------
+        new_fov : Union[Tuple[float, ...], torch.Tensor]
+            The new field of view to set for the dataset.
+        corner : Optional[Union[Tuple[float, ...], torch.Tensor]]
+            The corner position, in meters, from which to crop the dataset, if new_fov is smaller
+            than current fov. If None, the crop defaults to the center of the current fov.
+            If provided and corner=-1 for any dimension, that dimension will remain center cropped.
+        """
+
+        if not isinstance(new_fov, torch.Tensor):
+            new_fov = torch.tensor(new_fov, device=self.device, dtype=torch.float32)
+
+        old_im_size = torch.tensor(
+            self.im_size, device=self.device, dtype=torch.float32
+        )
+        new_im_size = tuple(
+            (old_im_size * (new_fov / self.fov)).cpu().numpy().round().astype(int)
+        )
+        new_iso = self.iso.clone()
+
+        if (new_im_size == self.im_size) and (corner is None):
+            return
+
+        if corner is not None:
+            if isinstance(corner, torch.Tensor):
+                corner = corner.cpu().numpy().tolist()
+            elif isinstance(corner, tuple):
+                corner = list(corner)
+            assert (
+                len(corner) == self.ndim
+            ), "corner must have the same number of dimensions as fov."
+
+            for d in range(self.ndim):
+                if corner[d] > 0:
+                    new_iso[d] = corner[d] + (new_fov[d] / 2)
+                    corner[d] = int(
+                        round(corner[d] / self.fov[d].item() * old_im_size[d].item())
+                    )
+                    print(f"corner[{d}] = {corner[d]}")
+
+        def resize_wrapper(
+            x: Optional[torch.Tensor], dim_ofs=0
+        ) -> Optional[torch.Tensor]:
+            if x is not None:
+                sz = list(new_im_size)
+                if dim_ofs > 0:
+                    sz = list(x.shape[:dim_ofs]) + sz
+                if corner is not None:
+                    for d in range(self.ndim):
+                        if corner[d] >= 0:
+                            # zero pad end of dim d + ofs
+                            if (old_im_size[d] - corner[d]) < sz[d + dim_ofs]:
+                                pad_shape = list(x.shape)
+                                pad_shape[d + dim_ofs] = sz[d + dim_ofs] - (
+                                    old_im_size[d] - corner[d]
+                                )
+                                zz = torch.zeros(
+                                    tuple(pad_shape), device=x.device, dtype=x.dtype
+                                )
+                                x = torch.cat((x, zz), dim=d + dim_ofs)
+                            # crop now, so no more resize on this dimension
+                            x = x.narrow(d + dim_ofs, corner[d], sz[d + dim_ofs])
+                            sz[d + dim_ofs] = x.shape[d + dim_ofs]
+                return resize(x, tuple(sz))
+            return None
+
+        self.PD = resize_wrapper(self.PD)
+        self.T2s = resize_wrapper(self.T2s)
+        self.T2 = resize_wrapper(self.T2)
+        self.T1 = resize_wrapper(self.T1)
+        self.B1 = resize_wrapper(self.B1)
+        self.B0 = resize_wrapper(self.B0)
+        self.mps = resize_wrapper(self.mps, dim_ofs=1)
+        self.mask = resize_wrapper(self.mask)
+
+        # update fov and coords
+        self.fov = new_fov
+        self.im_size = new_im_size
+        self.coords = self.update_coordinates(iso=new_iso)
+
     def __validate_tensor(self, x, name):
         if x is not None:
             assert (
@@ -379,6 +615,10 @@ def load_dataset(
 
     dataset = get_hf_dataset(dataset, device, verbose)
 
+    # pop fovs from dataset
+    fov = dataset.pop("fov", None)
+    assert fov is not None, "Dataset must contain 'fov' key."
+
     if filters is not None:
         if ("PD" in dataset) and (filters.pd_cfg is not None):
             dataset["PD"] = apply_filter(dataset["PD"], filters.pd_cfg)
@@ -410,6 +650,7 @@ def load_dataset(
             )
 
     return QuantitativeDataset(
+        fov=fov,
         PD=dataset["PD"],
         T2s=dataset.get("T2s", None),
         T2=dataset.get("T2", None),

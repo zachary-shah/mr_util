@@ -1,0 +1,2 @@
+TEST_CUDA = True
+TEST_DEVICE_IDX = 1

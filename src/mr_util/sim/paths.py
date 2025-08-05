@@ -15,3 +15,4 @@ def set_sim_data_dir(path: str):
     SIM_DATA_DIR = Path(path).expanduser()
     if not SIM_DATA_DIR.exists():
         SIM_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return SIM_DATA_DIR

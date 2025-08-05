@@ -1,4 +1,7 @@
 data
 raw
+.pytest_cache/
 
 *.pyc
+
+play.ipynb
