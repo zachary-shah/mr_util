@@ -1,7 +1,7 @@
-import torch
 from typing import Optional, Union
-import numpy as np
 
+import numpy as np
+import torch
 from scipy import ndimage
 from skimage.restoration import unwrap_phase as skimage_unwrap_phase
 
@@ -12,11 +12,13 @@ __all__ = [
     "torch_unwrap_1d",
 ]
 
-def nearest_neighbor_extrapolation(p: np.ndarray,
-                                   valid_mask: Optional[np.ndarray] = None) -> np.ndarray:
+
+def nearest_neighbor_extrapolation(
+    p: np.ndarray, valid_mask: Optional[np.ndarray] = None
+) -> np.ndarray:
     """
     Extrapolate NaN values in a 2D array using the nearest neighbor.
-    
+
     Parameters
     ----------
     p : np.ndarray
@@ -24,24 +26,26 @@ def nearest_neighbor_extrapolation(p: np.ndarray,
     valid_mask : np.ndarray, optional
         Boolean mask indicating valid (True) and invalid (False) values in the array.
         If None, the function will assume all values are valid.
-    
+
     Returns
     ---------
     np.ndarray
         Array with NaN values extrapolated.
     """
-    
+
     if valid_mask is None:
         valid_mask = ~np.isnan(p)
-    
+
     _, indices = ndimage.distance_transform_edt(~valid_mask, return_indices=True)
-    
+
     return p[tuple(indices)]
 
 
-def unwrap_phase(p: Union[np.ndarray, torch.Tensor],
-                 isocenter: Optional[tuple] = None,
-                 wrap_around: bool = False) -> Union[np.ndarray, torch.Tensor]:
+def unwrap_phase(
+    p: Union[np.ndarray, torch.Tensor],
+    isocenter: Optional[tuple] = None,
+    wrap_around: bool = False,
+) -> Union[np.ndarray, torch.Tensor]:
     """
     Use skimage's unwrap_phase to unwrap a phase map.
     Assume that isocenter does not have a wrap (DC term does not wrap for SH basis).
@@ -70,27 +74,29 @@ def unwrap_phase(p: Union[np.ndarray, torch.Tensor],
         p = nearest_neighbor_extrapolation(p)
 
     if isocenter is None:
-        isocenter = tuple([axs//2 for axs in p.shape])
-    
+        isocenter = tuple([axs // 2 for axs in p.shape])
+
     p_unwrapped = skimage_unwrap_phase(p, wrap_around=wrap_around)
 
     # remove 2pi bulk offsets
     p_center = p_unwrapped[isocenter]
-    k = p_center + np.pi - np.mod(p_center + np.pi, 2*np.pi)
-    p_unwrapped -= k   
+    k = p_center + np.pi - np.mod(p_center + np.pi, 2 * np.pi)
+    p_unwrapped -= k
 
     if device is not None:
         p_unwrapped = torch.tensor(p_unwrapped, dtype=torch.float32).to(device)
 
-    return p_unwrapped 
+    return p_unwrapped
 
 
 class _UnwrapSpatial(torch.autograd.Function):
     @staticmethod
-    def forward(x: torch.Tensor,
-                extrap_mask: torch.Tensor = None,
-                isocenter: tuple = None,
-                wrap_around: bool = False,) -> torch.Tensor:
+    def forward(
+        x: torch.Tensor,
+        extrap_mask: torch.Tensor = None,
+        isocenter: tuple = None,
+        wrap_around: bool = False,
+    ) -> torch.Tensor:
 
         # prep input for phase unwrap operation
         input_dtype = x.dtype
@@ -106,17 +112,17 @@ class _UnwrapSpatial(torch.autograd.Function):
         x_unwrapped = np.zeros_like(x_np)
         for i in range(x_np.shape[0]):
             x_unwrapped[i] = unwrap_phase(
-                x_np[i], 
-                isocenter=isocenter, 
+                x_np[i],
+                isocenter=isocenter,
                 wrap_around=wrap_around,
             )
 
         # restore to torch
         out = torch.tensor(
-            x_unwrapped, 
-            device=input_device, 
-            dtype=input_dtype, 
-            requires_grad=input_requires_grad
+            x_unwrapped,
+            device=input_device,
+            dtype=input_dtype,
+            requires_grad=input_requires_grad,
         )
 
         return out
@@ -132,16 +138,18 @@ class _UnwrapSpatial(torch.autograd.Function):
 
         if ctx.needs_input_grad[0]:
             grad_x = grad_output
-        
+
         return grad_x, grad_mask, grad_isocenter, grad_wrap_around
 
 
-def torch_unwrap_spatial(p: torch.Tensor,
-                         ndim: int,
-                         period: Optional[float] = None,
-                         valid_mask: torch.Tensor = None,
-                         isocenter: tuple = None,
-                         wrap_around: bool = False,) -> torch.Tensor:
+def torch_unwrap_spatial(
+    p: torch.Tensor,
+    ndim: int,
+    period: Optional[float] = None,
+    valid_mask: torch.Tensor = None,
+    isocenter: tuple = None,
+    wrap_around: bool = False,
+) -> torch.Tensor:
     """
     Wrapper for 2D/3D spatial unwrapping of a phase map in Torch, with torch.autograd support.
 
@@ -177,26 +185,28 @@ def torch_unwrap_spatial(p: torch.Tensor,
 
     if valid_mask is not None:
         valid_shape = valid_mask.shape[-ndim:]
-        assert valid_shape == im_size, f"Expected shape {im_size} for valid_mask, but got {valid_shape}"
+        assert (
+            valid_shape == im_size
+        ), f"Expected shape {im_size} for valid_mask, but got {valid_shape}"
         # match batching
         if valid_mask.shape == (*batch_dims, *im_size):
             valid_mask = valid_mask.reshape((-1, *im_size))
         elif valid_mask.shape == im_size:
             valid_mask = valid_mask.unsqueeze(0).expand(p.shape[0], *im_size)
 
-    if period is not None:  
+    if period is not None:
         p = p / period * (2 * torch.pi)
 
     p = _UnwrapSpatial.apply(p, valid_mask, isocenter, wrap_around)
 
     if period is not None:
         p = p / (2 * torch.pi) * period
-    
+
     if len(batch_dims) == 0:
         p = p.squeeze(0)
     else:
         p = p.reshape((*batch_dims, *im_size))
-    
+
     return p
 
 
@@ -219,7 +229,7 @@ def torch_unwrap_1d(
         Wrap-around period (default 2π).
     dim : int, optional
         Dimension along which to unwrap (default last axis).
-    
+
     Returns
     -------
     torch.Tensor
@@ -235,11 +245,11 @@ def torch_unwrap_1d(
 
     if p.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
         interval_high = period // 2
-        boundary_ambiguous = (period % 2 == 0)
+        boundary_ambiguous = period % 2 == 0
     else:
         interval_high = period / 2
         boundary_ambiguous = True
-    
+
     interval_low = -interval_high
 
     # map differences into the interval [low, low+period)
@@ -254,9 +264,7 @@ def torch_unwrap_1d(
 
     # Tolerance check for discontinuities
     ph_correct = torch.where(
-        torch.abs(dd) < discont,
-        torch.zeros_like(ph_correct),
-        ph_correct
+        torch.abs(dd) < discont, torch.zeros_like(ph_correct), ph_correct
     )
 
     # build output by cumulatively summing corrections

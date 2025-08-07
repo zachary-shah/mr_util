@@ -3,31 +3,24 @@ from typing import Literal, Optional
 import torch
 from scipy.interpolate import interp1d as scipy_interp1d
 
-from .unwrap import torch_unwrap_1d
-
 from .ext.torchcubicspline import torch_cubic_interpolate
+from .unwrap import torch_unwrap_1d
 
 __all__ = [
     "interp1d_complex",
 ]
 
-TORCH_INTERP_METHODS = [
-    'cubic',
-]
-SCIPY_INTERP_KINDS = [
-    'linear', 'nearest', 'zero', 'slinear', 'quadratic', 'cubic'
-]
-INTERP_METHODS = Literal[
-    'linear', 'nearest', 'zero', 'slinear', 'quadratic', 'cubic'
-]
+TORCH_INTERP_METHODS = ["cubic"]
+SCIPY_INTERP_KINDS = ["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
+INTERP_METHODS = Literal["linear", "nearest", "zero", "slinear", "quadratic", "cubic"]
 
 
 def __cubic_interp_torch(
-        y: torch.Tensor,
-        x: torch.Tensor,
-        x_new: torch.Tensor,
-        channel_dim: int = 1,
-        **kwargs,
+    y: torch.Tensor,
+    x: torch.Tensor,
+    x_new: torch.Tensor,
+    channel_dim: int = 1,
+    **kwargs,
 ) -> torch.Tensor:
     """
     Wrapper for patrick kidger's implementation of cubic interpolation
@@ -42,32 +35,24 @@ def __cubic_interp_torch(
 
 
 def __interp_scipy(
-        y: torch.Tensor,
-        x: torch.Tensor,
-        x_new: torch.Tensor,
-        kind: str = 'cubic',
-        **kwargs
+    y: torch.Tensor, x: torch.Tensor, x_new: torch.Tensor, kind: str = "cubic", **kwargs
 ) -> torch.Tensor:
     device = x.device
     interp_func = scipy_interp1d(
-        x.cpu().numpy(),
-        y.cpu().numpy(),
-        kind = kind,
-        axis = 0,
-        **kwargs
+        x.cpu().numpy(), y.cpu().numpy(), kind=kind, axis=0, **kwargs
     )
     return torch.from_numpy(interp_func(x_new.cpu().numpy())).to(device).to(x.dtype)
 
 
 def interp1d_complex(
-        y: torch.Tensor,
-        x: torch.Tensor,
-        x_new: torch.Tensor,
-        dim: int = 0,
-        method: INTERP_METHODS = 'cubic',
-        backend: Optional[Literal['scipy', 'torch']] = None,
-        mag_phase: bool = False,
-        **kwargs
+    y: torch.Tensor,
+    x: torch.Tensor,
+    x_new: torch.Tensor,
+    dim: int = 0,
+    method: INTERP_METHODS = "cubic",
+    backend: Optional[Literal["scipy", "torch"]] = None,
+    mag_phase: bool = False,
+    **kwargs,
 ) -> torch.Tensor:
     """
     Interpolate a complex signal along a single dimension.
@@ -110,27 +95,35 @@ def interp1d_complex(
     - add kb interpolation
     """
 
-    assert method in INTERP_METHODS.__args__, \
-        f"Interpolation method {method} not supported. Choose from {INTERP_METHODS.__args__}."
-    
-    assert backend in ['scipy', 'torch', None], f"Interpolation backend {backend} not supported. Choose from 'scipy' or 'torch'."
+    assert (
+        method in INTERP_METHODS.__args__
+    ), f"Interpolation method {method} not supported. Choose from {INTERP_METHODS.__args__}."
+
+    assert backend in [
+        "scipy",
+        "torch",
+        None,
+    ], f"Interpolation backend {backend} not supported. Choose from 'scipy' or 'torch'."
 
     # Defaults
     if backend is None:
-        backend = 'torch' if method in TORCH_INTERP_METHODS else 'scipy'
-    
-    if backend == 'torch':
-        assert method in TORCH_INTERP_METHODS, \
-            f"Interpolation method {method} not supported for torch backend. Choose from {TORCH_INTERP_METHODS}."
-    elif backend == 'scipy':
-        assert method in SCIPY_INTERP_KINDS, \
-            f"Interpolation method {method} not supported for scipy backend. Choose from {SCIPY_INTERP_KINDS}."
-    
+        backend = "torch" if method in TORCH_INTERP_METHODS else "scipy"
+
+    if backend == "torch":
+        assert (
+            method in TORCH_INTERP_METHODS
+        ), f"Interpolation method {method} not supported for torch backend. Choose from {TORCH_INTERP_METHODS}."
+    elif backend == "scipy":
+        assert (
+            method in SCIPY_INTERP_KINDS
+        ), f"Interpolation method {method} not supported for scipy backend. Choose from {SCIPY_INTERP_KINDS}."
+
     if dim != 0:
         y = y.moveaxis(dim, 0)
-    
-    assert y.shape[0] == x.shape[0], \
-        f"Length of time vector x ({x.shape[0]}) must match first dimension of y ({y.shape[0]})."
+
+    assert (
+        y.shape[0] == x.shape[0]
+    ), f"Length of time vector x ({x.shape[0]}) must match first dimension of y ({y.shape[0]})."
 
     if torch.is_complex(y) and mag_phase:
         mag = torch.abs(y)
@@ -138,16 +131,16 @@ def interp1d_complex(
 
         phs = torch_unwrap_1d(phs, dim=0)
 
-        if backend == 'torch' and method == 'cubic':
-                mag_interp = __cubic_interp_torch(mag, x, x_new, **kwargs)
-                phs_interp = __cubic_interp_torch(phs, x, x_new, **kwargs)
+        if backend == "torch" and method == "cubic":
+            mag_interp = __cubic_interp_torch(mag, x, x_new, **kwargs)
+            phs_interp = __cubic_interp_torch(phs, x, x_new, **kwargs)
         else:
             mag_interp = __interp_scipy(mag, x, x_new, kind=method, **kwargs)
             phs_interp = __interp_scipy(phs, x, x_new, kind=method, **kwargs)
 
         y_new = mag_interp * torch.exp(1j * phs_interp)
     else:
-        if backend == 'torch' and method == 'cubic':
+        if backend == "torch" and method == "cubic":
             y_new = __cubic_interp_torch(y, x, x_new, **kwargs)
         else:
             y_new = __interp_scipy(y, x, x_new, kind=method, **kwargs)
