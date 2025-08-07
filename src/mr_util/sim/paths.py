@@ -1,6 +1,6 @@
 from pathlib import Path
 
-SIM_DATA_DIR = "~/data"
+SIM_DATA_DIR = Path("~/data").expanduser()
 HF_REPO = "zachary-shah/mr_sim_data"
 
 SIM_DATASETS = {

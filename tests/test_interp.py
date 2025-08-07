@@ -1,6 +1,7 @@
 import torch
 from config import TEST_CUDA, TEST_DEVICE_IDX
 
+from mr_util import PROJECT_ROOT
 from mr_util.interp import interp1d_complex
 
 
@@ -11,7 +12,9 @@ def test_interp1d_cubic():
         device = torch.device("cpu")
 
     data = torch.load(
-        "./test_data/interp_data.pt", weights_only=True, map_location=device
+        PROJECT_ROOT / "tests/test_data/interp_data.pt",
+        weights_only=True,
+        map_location=device,
     )
     raw = data["raw"]
     interp_gt = data["interp"]
