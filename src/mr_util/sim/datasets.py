@@ -392,9 +392,17 @@ class QuantitativeDataset:
         """
 
         if self.spatial_slice is not None:
-            raise ValueError(
-                "Cannot resize matrix with a spatial slice set. Clear the slice first."
-            )
+            for d in range(self.ndim):
+                if new_im_size[d] != self.im_size[d]:
+                    if isinstance(self.spatial_slice[d], slice):
+                        slc = self.spatial_slice[d]
+                        assert (not slc.start) and (not slc.stop) and (not slc.step), (
+                            "Cannot resize matrix with a spatial slice set. Clear the slice first."
+                        )
+                    else:
+                        raise ValueError(
+                            "Cannot resize matrix with a spatial slice set as a list. Clear the slice first."
+                        )
 
         self.im_size = new_im_size
         self.coords = self._update_coordinates()
@@ -470,7 +478,6 @@ class QuantitativeDataset:
                     corner[d] = int(
                         round(corner[d] / self.fov[d].item() * old_im_size[d].item())
                     )
-                    print(f"corner[{d}] = {corner[d]}")
 
         def resize_wrapper(
             x: Optional[torch.Tensor], dim_ofs=0
