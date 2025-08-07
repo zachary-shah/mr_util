@@ -41,7 +41,7 @@ def __interp_scipy(
     interp_func = scipy_interp1d(
         x.cpu().numpy(), y.cpu().numpy(), kind=kind, axis=0, **kwargs
     )
-    return torch.from_numpy(interp_func(x_new.cpu().numpy())).to(device).to(x.dtype)
+    return torch.from_numpy(interp_func(x_new.cpu().numpy())).to(device).to(y.dtype)
 
 
 def interp1d_complex(
