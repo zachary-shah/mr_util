@@ -1,2 +1,4 @@
 GAMMA = 267.5 # rad ms-1 mT-1
-GAMMABAR = 4.2577 # ms-1 G-1
+GAMMABAR = 4.25774 # ms-1 G-1
+GAMMABAR_HZ_TESLA = GAMMABAR * 1e7 # Hz / T
+GAMMA_HZ_TESLA = GAMMA * 1e6 # rad Hz / T
