@@ -187,6 +187,77 @@ def nd_windowed_filter(
     return out
 
 
+def rotation_matrix_3d(thetas: torch.Tensor) -> torch.Tensor:
+    """
+    From Daniel Abraham `mr_recon` 
+
+    Computes product rotation matrices for a set of X Y Z rotation angles
+    
+    Parameters:
+    -----------
+    thetas : torch.Tensor
+        angle of rotation in radians with shape (..., 3)
+    
+    Returns:
+    --------
+    R : torch.Tensor
+        rotation matrix with shape (..., 3, 3)
+    """
+    tup = (None,) * (thetas.ndim - 1) + (slice(None),)
+    Rxs = rotation_matrix(torch.tensor([1.0, 0, 0], 
+                                       device=thetas.device, 
+                                       dtype=thetas.dtype)[tup], 
+                          thetas[..., 0])
+    Rys = rotation_matrix(torch.tensor([0, 1.0, 0], 
+                                       device=thetas.device, 
+                                       dtype=thetas.dtype)[tup], 
+                          thetas[..., 1])
+    Rzs = rotation_matrix(torch.tensor([0, 0, 1.0], 
+                                       device=thetas.device, 
+                                       dtype=thetas.dtype)[tup], 
+                          thetas[..., 2])
+    return Rxs @ Rys @ Rzs
+
+
+def rotation_matrix(axis: torch.Tensor, 
+                    theta: torch.Tensor) -> torch.Tensor:
+    """
+    From Daniel Abraham `mr_recon` 
+
+    Computes rotation matrices for a given axis and angle
+
+    Parameters:
+    -----------
+    axis : torch.Tensor
+        axis of rotation with shape (..., 3)
+    theta : torch.Tensor
+        angle of rotation in radians with shape (...)
+    
+    Returns:
+    --------
+    R : torch.Tensor
+        rotation matrix with shape (..., 3, 3)
+    """
+    
+    dev = axis.device
+    axis = axis / torch.linalg.norm(axis, dim=-1)
+    a = torch.cos(theta / 2.0)
+    b = -axis[..., 0] * torch.sin(theta / 2.0)
+    c = -axis[..., 1] * torch.sin(theta / 2.0)
+    d = -axis[..., 2] * torch.sin(theta / 2.0)
+    R = torch.zeros((*theta.shape, 3, 3), device=dev, dtype=torch.float32)
+    R[..., 0, 0] = a * a + b * b - c * c - d * d
+    R[..., 0, 1] = 2 * (b * c - a * d)
+    R[..., 0, 2] = 2 * (b * d + a * c)
+    R[..., 1, 0] = 2 * (b * c + a * d)
+    R[..., 1, 1] = a * a + c * c - b * b - d * d
+    R[..., 1, 2] = 2 * (c * d - a * b)
+    R[..., 2, 0] = 2 * (b * d - a * c)
+    R[..., 2, 1] = 2 * (c * d + a * b)
+    R[..., 2, 2] = a * a + d * d - b * b - c * c
+    return R
+
+
 def gen_grd(
     im_size: tuple, fovs: Optional[tuple] = None, balanced: Optional[bool] = False
 ) -> torch.Tensor:
