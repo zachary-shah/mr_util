@@ -1,6 +1,7 @@
 from typing import Literal, Optional
 
 import torch
+import numpy as np
 from scipy.interpolate import interp1d as scipy_interp1d
 
 from .ext.torchcubicspline import torch_cubic_interpolate
@@ -149,3 +150,93 @@ def interp1d_complex(
         y_new = y_new.moveaxis(0, dim)
 
     return y_new
+
+
+class interp1d_no_extrap:
+
+    def __init__(self, 
+                 x: torch.Tensor, 
+                 y: torch.Tensor,
+                 kind: str = 'linear', 
+                 axis: int = -1,
+                 copy: bool = True, 
+                 bounds_error: bool = None, 
+                 fill_value: float = np.nan,
+                 assume_sorted: bool = False,
+                 extrapolate_nearest_neighbor: bool = True,
+                 ):
+        """
+        Interpolation wrapper around scipy's interp1d, with optional nearest-neighbor extrapolation.
+
+        Parameters:
+            x (torch.Tensor): The input tensor containing the x-coordinates of the data points.
+            y (torch.Tensor): The input tensor containing the y-coordinates of the data points.
+            kind (str, optional): Specifies the kind of interpolation as a string ('linear', 'nearest', 'zero', 'slinear', 'quadratic', 'cubic', etc.). Default is 'linear'.
+            axis (int, optional): Axis along which to interpolate. Default is -1.
+            copy (bool, optional): If True, the input arrays are copied. Default is True.
+            bounds_error (bool or None, optional): If True, an error is raised when interpolation is attempted outside the range of x. If False, out-of-bounds values are assigned fill_value. Default is None.
+            fill_value (float or str, optional): Value to use for points outside the interpolation range. Default is torch.nan. If extrapolate_nearest_neighbor is True, this is set to 'extrapolate'.
+            assume_sorted (bool, optional): If True, x is assumed to be sorted. Default is False.
+            extrapolate_nearest_neighbor (bool, optional): If True, extrapolated values are replaced with the nearest neighbor value instead of standard extrapolation. If False, behaves like scipy's interp1d. Default is True.
+        Notes:
+            - When extrapolate_nearest_neighbor is True, bounds_error must be None.
+            - Converts input tensors to numpy arrays for compatibility with scipy's interp1d.
+            - Stores lower and upper bounds and corresponding y-values for nearest-neighbor extrapolation.
+        """
+
+        x = x.cpu().numpy()
+        y = y.cpu().numpy()
+
+        if extrapolate_nearest_neighbor:
+            assert bounds_error is None, "Cannot set bounds_error with extrapolate_nearest_neighbor=True"
+            fill_value = 'extrapolate'
+            
+        interp_func = scipy_interp1d(x, y, kind=kind, axis=axis, copy=copy, bounds_error=bounds_error, fill_value=fill_value, assume_sorted=assume_sorted)
+
+        self.ndim = y.ndim
+        self.kind = kind
+        self.axis = axis
+        self.interp_func = interp_func
+        self.extrapolate_nearest_neighbor = extrapolate_nearest_neighbor
+
+        # Find min and max x vals
+        self.lower_bound = np.min(x)
+        self.upper_bound = np.max(x)
+
+        self.lower_loc = np.argmin(x)
+        self.upper_loc = np.argmax(x)
+
+        # save lower and upper vals
+        lower_slc = [slice(None) for _ in range(self.ndim)]
+        lower_slc[axis] = self.lower_loc
+        self.lower_val = y[tuple(lower_slc)]
+
+        upper_slc = [slice(None) for _ in range(self.ndim)]
+        upper_slc[axis] = self.upper_loc
+        self.upper_val = y[tuple(upper_slc)]
+        
+    def __call__(self, xnew: torch.Tensor) -> torch.Tensor:
+        dev = xnew.device
+        dtype = xnew.dtype
+
+        # base interpolation call
+        ynew = self.interp_func(xnew.cpu().numpy())
+
+        ynew = torch.tensor(ynew, device=dev, dtype=dtype)
+
+        if self.extrapolate_nearest_neighbor:
+            # extrapolate nearest neighbor
+            lower_extrap_inds = torch.where(xnew < self.lower_bound)[0]
+            upper_extrap_inds = torch.where(xnew > self.upper_bound)[0]
+
+            for l in lower_extrap_inds:
+                lower_slc = [slice(None) for _ in range(self.ndim)]
+                lower_slc[self.axis] = l
+                ynew[tuple(lower_slc)] = self.lower_val
+
+            for u in upper_extrap_inds:
+                upper_slc = [slice(None) for _ in range(self.ndim)]
+                upper_slc[self.axis] = u
+                ynew[tuple(upper_slc)] = self.upper_val
+
+        return ynew

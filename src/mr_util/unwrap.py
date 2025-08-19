@@ -184,6 +184,7 @@ def torch_unwrap_spatial(
     p = p.reshape((-1, *im_size))
 
     if valid_mask is not None:
+        valid_mask = valid_mask.bool()
         valid_shape = valid_mask.shape[-ndim:]
         assert (
             valid_shape == im_size
