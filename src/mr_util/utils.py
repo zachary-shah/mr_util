@@ -46,7 +46,10 @@ def resize(input: torch.Tensor, oshape: Tuple[int, ...]) -> torch.Tensor:
     islice = tuple([slice(si, si + c) for si, c in zip(ishift, copy_shape)])
     oslice = tuple([slice(so, so + c) for so, c in zip(oshift, copy_shape)])
 
-    output = torch.zeros(oshape, dtype=input.dtype, device=input.device)
+    if torch.is_tensor(input):
+        output = torch.zeros(oshape, dtype=input.dtype, device=input.device)
+    else:
+        output = np.zeros(oshape, dtype=input.dtype)
     output[oslice] = input[islice]
 
     return output
