@@ -1,5 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Union
-
 import numpy as np
 import torch
 from scipy import ndimage
@@ -96,26 +96,56 @@ class _UnwrapSpatial(torch.autograd.Function):
         extrap_mask: torch.Tensor = None,
         isocenter: tuple = None,
         wrap_around: bool = False,
+        num_threads: Optional[int] = 0,
     ) -> torch.Tensor:
 
         # prep input for phase unwrap operation
         input_dtype = x.dtype
         input_device = x.device
         input_requires_grad = x.requires_grad
-        x_np = x.detach().cpu().numpy()
+        x_np = x.detach().cpu().clone().numpy()
+        B = x_np.shape[0]
 
         # operation (batched unwrap and extrapolation on phase map)
+        extrap_mask_np = None
         if extrap_mask is not None:
             extrap_mask_np = extrap_mask.detach().cpu().numpy()
-            x_np = nearest_neighbor_extrapolation(x_np, extrap_mask_np)
 
-        x_unwrapped = np.zeros_like(x_np)
-        for i in range(x_np.shape[0]):
-            x_unwrapped[i] = unwrap_phase(
-                x_np[i],
+        try:
+            thread_count = int(num_threads) if num_threads is not None else 0
+        except (TypeError, ValueError):
+            thread_count = 0
+        should_parallelize = thread_count > 1 and B > thread_count
+
+        def proc_ind(ind: int) -> np.ndarray:
+            slice_np = x_np[ind]
+            if extrap_mask is not None:
+                slice_np = nearest_neighbor_extrapolation(slice_np, extrap_mask_np[ind])
+            return unwrap_phase(
+                slice_np,
                 isocenter=isocenter,
                 wrap_around=wrap_around,
             )
+        
+        if should_parallelize:
+            t_edges = np.linspace(0, B, thread_count + 1, dtype=int)
+            t_starts = t_edges[:-1]
+            t_ends = t_edges[1:]
+            def _proc_thread(idx: int) -> np.ndarray:
+                ts = t_starts[idx]
+                te = t_ends[idx]
+                x_unwrapped_thread = np.zeros_like(x_np[ts:te])
+                for irel, i in enumerate(range(ts, te)):
+                    x_unwrapped_thread[irel] = proc_ind(i)
+                return x_unwrapped_thread
+    
+            with ThreadPoolExecutor(max_workers=thread_count) as executor:
+                results = list(executor.map(_proc_thread, range(thread_count)))
+            x_unwrapped = np.concatenate(results, axis=0)
+        else:
+            x_unwrapped = np.zeros_like(x_np)
+            for i in range(B):
+                x_unwrapped[i] = proc_ind(i)
 
         # restore to torch
         out = torch.tensor(
@@ -134,12 +164,12 @@ class _UnwrapSpatial(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
 
-        grad_x = grad_mask = grad_isocenter = grad_wrap_around = None
+        grad_x = grad_mask = grad_isocenter = grad_wrap_around = grad_num_threads = None
 
         if ctx.needs_input_grad[0]:
             grad_x = grad_output
 
-        return grad_x, grad_mask, grad_isocenter, grad_wrap_around
+        return grad_x, grad_mask, grad_isocenter, grad_wrap_around, grad_num_threads
 
 
 def torch_unwrap_spatial(
@@ -149,6 +179,7 @@ def torch_unwrap_spatial(
     valid_mask: torch.Tensor = None,
     isocenter: tuple = None,
     wrap_around: bool = False,
+    num_threads: Optional[int] = 0,
 ) -> torch.Tensor:
     """
     Wrapper for 2D/3D spatial unwrapping of a phase map in Torch, with torch.autograd support.
@@ -168,6 +199,9 @@ def torch_unwrap_spatial(
         Isocenter for setting relative point for unwrap. If none, unwraps relative to center.
     wrap_around : bool
         If true, will unwrap assuming circular continuity across image
+    num_threads : int, optional
+        Number of threads to use for batched unwrapping. If None or 0, unwrapping
+        proceeds single-threaded.
 
     Returns
     -------
@@ -198,7 +232,7 @@ def torch_unwrap_spatial(
     if period is not None:
         p = p / period * (2 * torch.pi)
 
-    p = _UnwrapSpatial.apply(p, valid_mask, isocenter, wrap_around)
+    p = _UnwrapSpatial.apply(p, valid_mask, isocenter, wrap_around, num_threads)
 
     if period is not None:
         p = p / (2 * torch.pi) * period
