@@ -7,6 +7,8 @@ import torch
 from scipy.ndimage import gaussian_filter, median_filter
 from scipy.signal import windows
 
+from .filter import gaussian_filter_torch, median_filter_torch
+
 SPATIAL_RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest"]
 RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest", "fourier"]
 WINDOW_METHODS = Literal["boxcar", "hamming", "hann", "blackman", "kaiser"]
@@ -487,7 +489,7 @@ def spatial_resize(
     return x
 
 
-def spatial_filter(
+def spatial_filter_scipy_backend(
     x: torch.Tensor,
     im_size: Tuple[int, ...],
     gaussian_filter_size: Optional[Union[float, Tuple[float, ...]]] = None,
@@ -495,6 +497,7 @@ def spatial_filter(
 ) -> torch.Tensor:
     """
     Apply spatial filters to image.
+    DEPRECIATED: uses scipy backends.
 
     Parameters:
     -----------
@@ -553,6 +556,59 @@ def spatial_filter(
 
     if torch_info is not None:
         x = torch.from_numpy(x).to(torch_info[0]).to(torch_info[1])
+
+    return x
+
+
+def spatial_filter(
+    x: torch.Tensor,
+    im_size: Tuple[int, ...],
+    gaussian_filter_size: Optional[Union[float, Tuple[float, ...]]] = None,
+    median_filter_size: Optional[Union[int, Tuple[int, ...]]] = None,
+    use_depreciated: bool = False,
+) -> torch.Tensor:
+    """
+    Apply spatial filters to (last dims) of image.
+
+    Parameters:
+    -----------
+    x : torch.Tensor
+        The input tensor with shape (..., *im_size)
+    im_size : Tuple[int, ...]
+        The size of the image to filter
+    gaussian_filter_size : Optional[Tuple[int, ...]]
+        The size of the gaussian filter to apply, if None, no gaussian filter is applied
+    median_filter_size : Optional[Tuple[int, ...]]
+        The size of the median filter to apply, if None, no median filter is applied
+
+    Returns:
+    --------
+    x : torch.Tensor
+        The filtered tensor with shape (..., *im_size)
+    """
+
+    if use_depreciated:
+        return spatial_filter_scipy_backend(
+            x, im_size, gaussian_filter_size, median_filter_size
+        )
+
+    if gaussian_filter_size is None and median_filter_size is None:
+        return x
+
+    # dims to filter
+    filt_dims = tuple(range(-len(im_size), 0))
+
+    if median_filter_size is not None:
+        # filter real/imag seperately if complex
+        is_complex = torch.is_complex(x)    
+        if is_complex:
+            x = torch.stack([x.real, x.imag], dim=0)
+        x = median_filter_torch(x, size=median_filter_size, axes=filt_dims)
+        if is_complex:
+            x = x[0] + 1j * x[1]
+
+    if gaussian_filter_size is not None:
+        x = gaussian_filter_torch(x, sigma=gaussian_filter_size, axes=filt_dims)
 
     return x
 
