@@ -15,7 +15,7 @@ WINDOW_METHODS = Literal["boxcar", "hamming", "hann", "blackman", "kaiser"]
 DEFAULT_WINDOW = "hann"
 
 
-def resize(input: torch.Tensor, oshape: Tuple[int, ...]) -> torch.Tensor:
+def resize(input: torch.Tensor, oshape: Tuple[int, ...], padval=None) -> torch.Tensor:
     """
     Resize with zero-padding or cropping.
 
@@ -52,6 +52,9 @@ def resize(input: torch.Tensor, oshape: Tuple[int, ...]) -> torch.Tensor:
         output = torch.zeros(oshape, dtype=input.dtype, device=input.device)
     else:
         output = np.zeros(oshape, dtype=input.dtype)
+    if padval is not None:
+        output[:] = padval
+
     output[oslice] = input[islice]
 
     return output
