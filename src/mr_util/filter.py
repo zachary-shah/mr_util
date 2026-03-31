@@ -7,6 +7,12 @@ import warnings
 
 _MAX_REFLECT_BATCH = 2 ** 16 - 1  # CUDA reflect padding limit along batch dim
 
+__all__ = [
+    "gaussian_filter_torch",
+    "median_filter_torch",
+    "gaussian_filter_scipy",
+    "median_filter_scipy",
+]
 
 ## ----------- Gaussian Filter ----------- ##
 

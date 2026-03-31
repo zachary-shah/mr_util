@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter, median_filter
 from scipy.signal import windows
+from tqdm import tqdm
 
 from .filter import gaussian_filter_torch, median_filter_torch
 
@@ -13,6 +14,62 @@ SPATIAL_RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest"]
 RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest", "fourier"]
 WINDOW_METHODS = Literal["boxcar", "hamming", "hann", "blackman", "kaiser"]
 DEFAULT_WINDOW = "hann"
+
+
+__all__ = [
+    "batch_iterator",
+    "tqdm_batch_iterator",
+    "resize",
+    "fft",
+    "ifft",
+    "hilbert",
+    "nd_windowed_filter",
+    "rotation_matrix_3d",
+    "rotation_matrix",
+    "gen_grd",
+    "spatial_resize",
+    "spatial_filter",
+    "normalize",
+    "binary_dilation_1d",
+]
+
+def batch_iterator(total: int, batch_size: int, return_len: bool = False):
+    """
+    Get iteratable list of indices for batched iteration
+
+    Parameters
+    ----------
+    total : int
+        Total number of elements to iterate over
+    batch_size : int
+        Batch size
+
+    Returns
+    -------
+    batch_list : list[tuple]
+        List of tuples of the form (start, end) where start is the
+        starting index of the batch and end is the ending index of the batch.
+    """
+    assert total > 0, f"batch_iterator called with {total} elements"
+    delim = list(range(0, total, batch_size)) + [total]
+    iterator = zip(delim[:-1], delim[1:])
+    if return_len:
+        N = len(delim) - 1
+        return iterator, N
+    return iterator
+
+
+def tqdm_batch_iterator(total: int, batch_size: Optional[int] = None, **tqdm_kwargs):
+    """Convenience function for wrapping batch_iterator with a progress bar"""
+    if batch_size is None:
+        tqdm_total = 1
+    else:
+        tqdm_total = -(-total // batch_size)
+    return tqdm(
+        batch_iterator(total, batch_size),
+        total=tqdm_total,
+        **tqdm_kwargs,
+    )
 
 
 def resize(input: torch.Tensor, oshape: Tuple[int, ...], padval=None) -> torch.Tensor:
@@ -131,6 +188,41 @@ def ifft(
     else:
         x = torch.fft.ifftn(x, s=o_im_shape, dim=fftdims, norm="ortho")
 
+    return x
+
+
+def hilbert(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Compute the Hilbert transform of a real-valued signal.
+
+    Parameters:
+    -----------
+    x : torch.Tensor
+        The real-valued signal to compute the Hilbert transform of.
+    dim : int
+        The dimension over which to compute the Hilbert transform.
+        Default is -1.
+
+    Returns:
+    --------
+    x : torch.Tensor
+        The Hilbert transform of the signal.
+    """
+    N = x.shape[dim]
+    Xf = torch.fft.fft(x, dim=dim)
+    h = torch.zeros(N, dtype=x.dtype, device=x.device)
+    if N % 2 == 0:
+        h[0] = 1
+        h[N // 2] = 1
+        h[1:N // 2] = 2
+    else:
+        h[0] = 1
+        h[1:(N + 1) // 2] = 2
+    if x.ndim > 1:
+        hind = [None,] * x.ndim
+        hind[dim] = slice(None)
+        h = h[tuple(hind)]
+    x = torch.fft.ifft(Xf * h, dim=dim)
     return x
 
 
@@ -573,6 +665,7 @@ def spatial_filter(
     im_size: Tuple[int, ...],
     gaussian_filter_size: Optional[Union[float, Tuple[float, ...]]] = None,
     median_filter_size: Optional[Union[int, Tuple[int, ...]]] = None,
+    filt_dims: Optional[Tuple[int, ...]] = None,
     use_depreciated: bool = False,
 ) -> torch.Tensor:
     """
@@ -588,6 +681,8 @@ def spatial_filter(
         The size of the gaussian filter to apply, if None, no gaussian filter is applied
     median_filter_size : Optional[Tuple[int, ...]]
         The size of the median filter to apply, if None, no median filter is applied
+    filt_dims: Optional[Tuple[int, ...]]
+        The dimensions to filter, if None, uses last dims
 
     Returns:
     --------
@@ -604,7 +699,8 @@ def spatial_filter(
         return x
 
     # dims to filter
-    filt_dims = tuple(range(-len(im_size), 0))
+    if filt_dims is None:
+        filt_dims = tuple(range(-len(im_size), 0))
 
     if median_filter_size is not None:
         # filter real/imag seperately if complex
@@ -632,3 +728,42 @@ def normalize(shifted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     ) / (torch.linalg.vector_norm(shifted.flatten(), dim=0) ** 2 + 1e-8)
     shifted = shifted * scale
     return shifted
+
+
+def binary_dilation_1d(
+    x: torch.Tensor,
+    iterations: int = 1,
+    dim: int = -1,
+) -> torch.Tensor:
+    """
+    Perform 1D binary dilation on a tensor.
+
+    Parameters:
+    -----------
+    x : torch.Tensor
+        The input tensor with shape (..., *im_size)
+    iterations : int
+        The number of iterations of dilation to apply.
+    dim : int
+        The dimension over which to perform the dilation.
+        Default is -1.
+
+    Returns:
+    --------
+    x : torch.Tensor
+        The dilated tensor with shape (..., *im_size)
+    """
+    x = x.bool()
+    if iterations < 0:
+        raise ValueError("iterations must be non-negative")
+    if iterations == 0:
+        return x
+
+    dim = dim % x.ndim
+    x_move = x.movedim(dim, -1)
+    x_flat = x_move.reshape(-1, 1, x_move.shape[-1]).to(torch.float32)
+
+    for _ in range(iterations):
+        x_flat = torch.nn.functional.max_pool1d(x_flat, kernel_size=3, stride=1, padding=1)
+
+    return x_flat.bool().reshape(x_move.shape).movedim(-1, dim)

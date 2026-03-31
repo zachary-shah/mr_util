@@ -9,6 +9,7 @@ from .unwrap import torch_unwrap_1d
 
 __all__ = [
     "interp1d_complex",
+    "interp1d_no_extrap",
 ]
 
 TORCH_INTERP_METHODS = ["cubic"]
