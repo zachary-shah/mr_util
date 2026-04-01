@@ -122,7 +122,7 @@ def rf_spike_filter(
     if freq_ranges is not None:
         pad_width = 500
         ifreqs = instantaneous_frequency(
-            grad, dt, dim=0, 
+            grad.to(device), dt, dim=0, 
             smooth=True,
             smooth_window_len=100,
             pad_width=pad_width,
