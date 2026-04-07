@@ -35,6 +35,7 @@ def rf_spike_filter(
     peak_width: int = 5,
     freq_ranges: Optional[List[Tuple[float, float]]] = None,
     return_valid = False,
+    freq_trim_end: bool = True,
     batch_size: int = 256,
     verbose: bool = True,
 ) -> torch.Tensor:
@@ -120,7 +121,7 @@ def rf_spike_filter(
 
     # frequency mask
     if freq_ranges is not None:
-        pad_width = 500
+        pad_width = min(grad.shape[0] // 20, 500)
         ifreqs = instantaneous_frequency(
             grad.to(device), dt, dim=0, 
             smooth=True,
@@ -129,7 +130,8 @@ def rf_spike_filter(
             clip_max=5000, # max [Hz]
         ).mean(dim=(1, 2)) # (T,)
         ifreqs[:pad_width] = 0
-        ifreqs[-pad_width:] = 0
+        if freq_trim_end:
+            ifreqs[-pad_width:] = 0
 
         freq_mask = torch.zeros_like(ifreqs, dtype=torch.bool)
         for fr in freq_ranges:
