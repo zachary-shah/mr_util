@@ -6,6 +6,7 @@ from scipy.signal import decimate
 from .utils import (
     spatial_filter, 
     tqdm_batch_iterator, 
+    batch_iterator,
     binary_dilation_1d,
 )
 from .ifreq import instantaneous_frequency
@@ -25,7 +26,7 @@ def bool_array_to_str(arr, N=50):
 def rf_spike_filter(
     ksp: torch.Tensor,
     trj: torch.Tensor,
-    grad: torch.Tensor,
+    grad: Optional[torch.Tensor],
     dt: float,
     device: Optional[torch.device] = None,
     # Filtering Parameters
@@ -38,7 +39,10 @@ def rf_spike_filter(
     freq_trim_end: bool = True,
     batch_size: int = 256,
     verbose: bool = True,
-) -> torch.Tensor:
+    return_ksp_detrended: bool = False,
+    spike_thresh_quantile: float = 0.99,
+    spike_thresh_quantile_window: Optional[int] = None,
+) -> torch.Tensor: 
     """
     Filter out spikes in the k-space data.
     Does this by normalizing data with heuristics, searching for peaks with some peak_width,
@@ -85,6 +89,9 @@ def rf_spike_filter(
         device = ksp.device
     T, S = ksp.shape[-2:]
 
+    if freq_ranges is not None:
+        assert grad is not None, "grad must be provided if freq_ranges is not None"
+
     # First, normalize data by kr
     ksp = ksp * (torch.norm(trj, dim=-1).to(ksp.device) ** kr_exp)
 
@@ -93,35 +100,61 @@ def rf_spike_filter(
     ksp = ksp.reshape(-1, T, S)
     B = ksp.shape[0]
     batch_size = max(batch_size // S, 1)
+    W = spike_thresh_quantile_window
+    if W is not None:
+        W = int(W)
+    batch_size = int(batch_size)
     
     peak_mask = torch.zeros_like(ksp, dtype=torch.bool)
-    for iL, iR in tqdm_batch_iterator(B, batch_size, disable=not verbose):
+    if return_ksp_detrended:
+        ksp_detrended = torch.zeros_like(ksp)
+        ksp_thresh = torch.zeros_like(ksp)
+
+    for iL, iR in tqdm_batch_iterator(B, batch_size, disable=not verbose, desc="RF Spike Filtering"):
         ksp_batch = ksp[iL:iR].abs()
         
         # high-pass filter the data
         ksp_trend = spatial_filter(
             ksp_batch, (T,), 
             gaussian_filter_size=detrend_smooth_len, 
-            median_filter_size=((detrend_smooth_len // 2) * 2 + 1,),
+            median_filter_size=((int(detrend_smooth_len) // 2) * 2 + 1,),
             filt_dims=(-2,), 
         )
         ksp_batch = (ksp_batch - ksp_trend).abs()
 
         # detect peaks as locations above spike height threshold
-        spike_scale = (ksp_batch.quantile(0.99, dim=1, keepdim=True))
-        peak_mask_batch = (ksp_batch >= spike_scale * height_factor)
+        if W is not None and (W < T):
+            # moving average quantile
+            spike_scale = torch.zeros_like(ksp_batch, dtype=torch.float32)
+            for tL, tR in batch_iterator(T, W):
+                spike_scale[:, tL:tR] = ksp_batch[:, tL:tR].quantile(spike_thresh_quantile, dim=1, keepdim=True)
+            spike_scale = spatial_filter(spike_scale, (T,), gaussian_filter_size=W//2, filt_dims=(-2,))
+        else:
+            # global quantile
+            spike_scale = (ksp_batch.quantile(spike_thresh_quantile, dim=1, keepdim=True))
+        spike_scale = spike_scale * height_factor
+
+        peak_mask_batch = (ksp_batch >= spike_scale)
+
+        if return_ksp_detrended:
+            ksp_detrended[iL:iR] = ksp_batch
+            ksp_thresh[iL:iR] = spike_scale
 
         # potentially dilate the mask to cover wider regions, but only to above some threshold
         if peak_width > 1:
             expand_mask_batch = ksp_batch >= ksp_batch.quantile(0.9, dim=1, keepdim=True)
-            peak_mask_batch = binary_dilation_1d(peak_mask_batch, iterations=peak_width - 1, dim=1)
+            peak_mask_batch = binary_dilation_1d(peak_mask_batch, iterations=int(peak_width - 1), dim=1)
             peak_mask_batch = peak_mask_batch & expand_mask_batch
 
         peak_mask[iL:iR] = peak_mask_batch
 
+    if return_ksp_detrended:
+        ksp_detrended = ksp_detrended.reshape(*batch_dims, T, S)
+        ksp_thresh = ksp_thresh.reshape(*batch_dims, T, S)
+
     # frequency mask
     if freq_ranges is not None:
-        pad_width = min(grad.shape[0] // 20, 500)
+        pad_width = int(min(grad.shape[0] // 20, 500))
         ifreqs = instantaneous_frequency(
             grad.to(device), dt, dim=0, 
             smooth=True,
@@ -148,5 +181,8 @@ def rf_spike_filter(
 
     if return_valid:
         return_slc = ~return_slc
+
+    if return_ksp_detrended:
+        return return_slc, ksp_detrended, ksp_thresh
 
     return return_slc
