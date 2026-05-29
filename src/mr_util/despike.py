@@ -42,6 +42,7 @@ def rf_spike_filter(
     return_ksp_detrended: bool = False,
     spike_thresh_quantile: float = 0.99,
     spike_thresh_quantile_window: Optional[int] = None,
+    expand_mask_batch_quantile: float = 0.9,
 ) -> torch.Tensor: 
     """
     Filter out spikes in the k-space data.
@@ -110,7 +111,7 @@ def rf_spike_filter(
         ksp_detrended = torch.zeros_like(ksp)
         ksp_thresh = torch.zeros_like(ksp)
 
-    for iL, iR in tqdm_batch_iterator(B, batch_size, disable=not verbose, desc="RF Spike Filtering"):
+    for iL, iR in tqdm_batch_iterator(B, batch_size, disable=not verbose, desc="RF Spike Filtering", leave=False):
         ksp_batch = ksp[iL:iR].abs()
         
         # high-pass filter the data
@@ -142,7 +143,8 @@ def rf_spike_filter(
 
         # potentially dilate the mask to cover wider regions, but only to above some threshold
         if peak_width > 1:
-            expand_mask_batch = ksp_batch >= ksp_batch.quantile(0.9, dim=1, keepdim=True)
+            expand_mask_batch = ksp_batch >= ksp_batch.quantile(expand_mask_batch_quantile, dim=1, keepdim=True)
+            expand_mask_batch = expand_mask_batch | peak_mask_batch # preserve peaks that are already found
             peak_mask_batch = binary_dilation_1d(peak_mask_batch, iterations=int(peak_width - 1), dim=1)
             peak_mask_batch = peak_mask_batch & expand_mask_batch
 
