@@ -9,12 +9,24 @@ from scipy.signal import windows
 from tqdm import tqdm
 
 from .filter import gaussian_filter_torch, median_filter_torch
-
-SPATIAL_RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest"]
-RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest", "fourier"]
-WINDOW_METHODS = Literal["boxcar", "hamming", "hann", "blackman", "kaiser"]
-DEFAULT_WINDOW = "hann"
-
+from .spatial import (
+    TRITON_AVAILABLE,
+    SPATIAL_RESIZE_METHODS,
+    RESIZE_METHODS,
+    WINDOW_METHODS,
+    DEFAULT_WINDOW,
+    _cubic_spline_prefilter_kernel,
+    _fourier_resize,
+    _spatial_resize,
+    _spatial_resize_poly_lagrange,
+    _spatial_resize_poly_cubic,
+    _cubic_spline_filter_axis,
+    hilbert,
+    nd_windowed_filter,
+    rotation_matrix_3d,
+    rotation_matrix,
+    gen_grd,
+)
 
 __all__ = [
     "batch_iterator",
@@ -191,330 +203,13 @@ def ifft(
     return x
 
 
-def hilbert(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Compute the Hilbert transform of a real-valued signal.
-
-    Parameters:
-    -----------
-    x : torch.Tensor
-        The real-valued signal to compute the Hilbert transform of.
-    dim : int
-        The dimension over which to compute the Hilbert transform.
-        Default is -1.
-
-    Returns:
-    --------
-    x : torch.Tensor
-        The Hilbert transform of the signal.
-    """
-    N = x.shape[dim]
-    Xf = torch.fft.fft(x, dim=dim)
-    h = torch.zeros(N, dtype=x.dtype, device=x.device)
-    if N % 2 == 0:
-        h[0] = 1
-        h[N // 2] = 1
-        h[1:N // 2] = 2
-    else:
-        h[0] = 1
-        h[1:(N + 1) // 2] = 2
-    if x.ndim > 1:
-        hind = [None,] * x.ndim
-        hind[dim] = slice(None)
-        h = h[tuple(hind)]
-    x = torch.fft.ifft(Xf * h, dim=dim)
-    return x
-
-
-def nd_windowed_filter(
-    w_shape: Tuple[int, ...],
-    window: WINDOW_METHODS = "hann",
-    oshape: Optional[Tuple[int, ...]] = None,
-) -> torch.Tensor:
-    """
-    Get n-dimensional windowed fourier filter for data with shape im_shape, where the window is defined by w_shape.
-
-    Returns window of shape w_shape, or a window padded to oshape if provided.
-    """
-    if isinstance(w_shape, int):
-        w_shape = (w_shape,)
-    if isinstance(oshape, int):
-        oshape = (oshape,)
-
-    if oshape is None:
-        oshape = w_shape
-    else:
-        assert len(oshape) == len(
-            w_shape
-        ), "Output shape must have same number of dimensions as window shape."
-        assert all(
-            [oshape[i] >= w_shape[i] for i in range(len(oshape))]
-        ), "Output shape must be larger than window shape."
-
-    d = len(w_shape)
-    assert d <= 3, "Only 1, 2, or 3 dimensions supported."
-
-    if window == "hamming":
-        wfunc = lambda x: windows.hamming(x)
-    elif window == "kaiser":
-        wfunc = lambda x: windows.kaiser(x, beta=14)
-    elif window == "gaussian":
-        wfunc = lambda x: windows.gaussian(x, std=sqrt(max(w_shape)))
-    elif window == "tukey":
-        wfunc = lambda x: windows.tukey(x, alpha=0.5)
-    elif window == "hann":
-        wfunc = lambda x: windows.hann(x)
-    elif window == "boxcar":
-        wfunc = lambda x: windows.boxcar(x)
-    else:
-        raise ValueError(
-            f"Unknown window type: {window}. Must be one of {WINDOW_METHODS.__args__}."
-        )
-
-    # form n-d window
-    if d == 1:
-        out = wfunc(w_shape[0])
-    elif d == 2:
-        out = wfunc(w_shape[0])[:, None] @ wfunc(w_shape[1])[None, :]
-    elif d == 3:
-        out_2d = wfunc(w_shape[0])[:, None] @ wfunc(w_shape[1])[None, :]
-        out = out_2d[:, :, None] * wfunc(w_shape[2])[None, None, :]
-
-    # zero pad window to oshape
-    if oshape != w_shape:
-        out = resize(out, oshape)
-
-    return out
-
-
-def rotation_matrix_3d(thetas: torch.Tensor) -> torch.Tensor:
-    """
-    From Daniel Abraham `mr_recon` 
-
-    Computes product rotation matrices for a set of X Y Z rotation angles
-    
-    Parameters:
-    -----------
-    thetas : torch.Tensor
-        angle of rotation in radians with shape (..., 3)
-    
-    Returns:
-    --------
-    R : torch.Tensor
-        rotation matrix with shape (..., 3, 3)
-    """
-    tup = (None,) * (thetas.ndim - 1) + (slice(None),)
-    Rxs = rotation_matrix(torch.tensor([1.0, 0, 0], 
-                                       device=thetas.device, 
-                                       dtype=thetas.dtype)[tup], 
-                          thetas[..., 0])
-    Rys = rotation_matrix(torch.tensor([0, 1.0, 0], 
-                                       device=thetas.device, 
-                                       dtype=thetas.dtype)[tup], 
-                          thetas[..., 1])
-    Rzs = rotation_matrix(torch.tensor([0, 0, 1.0], 
-                                       device=thetas.device, 
-                                       dtype=thetas.dtype)[tup], 
-                          thetas[..., 2])
-    return Rxs @ Rys @ Rzs
-
-
-def rotation_matrix(axis: torch.Tensor, 
-                    theta: torch.Tensor) -> torch.Tensor:
-    """
-    From Daniel Abraham `mr_recon` 
-
-    Computes rotation matrices for a given axis and angle
-
-    Parameters:
-    -----------
-    axis : torch.Tensor
-        axis of rotation with shape (..., 3)
-    theta : torch.Tensor
-        angle of rotation in radians with shape (...)
-    
-    Returns:
-    --------
-    R : torch.Tensor
-        rotation matrix with shape (..., 3, 3)
-    """
-    
-    dev = axis.device
-    axis = axis / torch.linalg.norm(axis, dim=-1)
-    a = torch.cos(theta / 2.0)
-    b = -axis[..., 0] * torch.sin(theta / 2.0)
-    c = -axis[..., 1] * torch.sin(theta / 2.0)
-    d = -axis[..., 2] * torch.sin(theta / 2.0)
-    R = torch.zeros((*theta.shape, 3, 3), device=dev, dtype=torch.float32)
-    R[..., 0, 0] = a * a + b * b - c * c - d * d
-    R[..., 0, 1] = 2 * (b * c - a * d)
-    R[..., 0, 2] = 2 * (b * d + a * c)
-    R[..., 1, 0] = 2 * (b * c + a * d)
-    R[..., 1, 1] = a * a + c * c - b * b - d * d
-    R[..., 1, 2] = 2 * (c * d - a * b)
-    R[..., 2, 0] = 2 * (b * d - a * c)
-    R[..., 2, 1] = 2 * (c * d + a * b)
-    R[..., 2, 2] = a * a + d * d - b * b - c * c
-    return R
-
-
-def gen_grd(
-    im_size: tuple, fovs: Optional[tuple] = None, balanced: Optional[bool] = False,
-    device: Optional[torch.device] = None
-) -> torch.Tensor:
-    """
-    Generates a grid of points given image size and FOVs
-
-    Parameters:
-    -----------
-    im_size : tuple
-        image dimensions
-    fovs : tuple
-        field of views, same size as im_size
-
-    Returns:
-    --------
-    grd : torch.Tensor
-        grid of points with shape (*im_size, len(im_size))
-    """
-    kwargs = {}
-    if device is not None:
-        kwargs['device'] = device
-        
-    if fovs is None:
-        fovs = (1,) * len(im_size)
-    if balanced:
-        lins = [
-            fovs[i] * torch.linspace(-1 / 2, 1 / 2, im_size[i], **kwargs)
-            for i in range(len(im_size))
-        ]
-    else:
-        lins = [
-            fovs[i]
-            * torch.arange(-(im_size[i] // 2), im_size[i] // 2 + (im_size[i] % 2), **kwargs)
-            / (im_size[i])
-            for i in range(len(im_size))
-        ]
-    grds = torch.meshgrid(*lins, indexing="ij")
-    grd = torch.cat([g[..., None] for g in grds], dim=-1)
-
-    return grd.type(torch.float32)
-
-
-def _fourier_resize(
-    x: torch.Tensor, new_shape: Tuple[int, ...], window: Optional[WINDOW_METHODS] = None
-) -> torch.Tensor:
-    """
-    Take an image and reshape it to new_shape using fourier padding
-
-    Parameters:
-    -----------
-    x : torch.Tensor
-        The input tensor with shape (..., *inp_im_size)
-    new_shape : Tuple[int, ...]
-        The size of the image to resize to
-    window : Optional[WINDOW_METHODS]
-        The window to apply to the fourier interpolation. Options:
-            - 'boxcar': boxcar window (default)
-            - 'hamming': hamming window
-            - 'hann': hann window
-            - 'blackman': blackman window
-            - 'kaiser': kaiser window
-
-    Returns:
-    --------
-    x : torch.Tensor
-        The resized tensor with shape (..., *new_shape)
-    """
-
-    isComplex = False
-
-    if window is None:
-        window = DEFAULT_WINDOW
-
-    if torch.is_complex(x):
-        isComplex = True
-
-    ndim = len(new_shape)
-    fft_shape = x.shape[-ndim:]
-    abs_max = x.abs().max()
-
-    x = fft(x, fft_shape)
-
-    if window != "boxcar":
-        wind = (
-            torch.from_numpy(nd_windowed_filter(fft_shape, window=window))
-            .to(x.device)
-            .to(x.dtype)
-        )
-        for _ in range(x.ndim - wind.ndim):
-            wind = wind[None, ...]
-        x = x * wind
-
-    x = ifft(x, new_shape)
-
-    if not isComplex:
-        x = x.real
-
-    x = x / x.abs().max() * abs_max
-
-    return x
-
-
-def _spatial_resize(
-    x: torch.Tensor,
-    im_size: tuple,
-    method: SPATIAL_RESIZE_METHODS = "bilinear",
-) -> torch.Tensor:
-    """
-    Resize a spatial tensor to a new spatial size.
-
-    Parameters:
-    -----------
-    x : (torch.Tensor)
-        The input tensor with shape (B, *inp_im_size)
-    im_size : (tuple)
-        The size of the image to resize to
-    method : (Optional[str])
-        The method to use for resizing, options are:
-            - 'bilinear': linear interpolation (default)
-            - 'bicubic': cubic interpolation
-            - 'nearest': nearest sample interpolation
-
-    Returns:
-    --------
-    x_rs : (torch.Tensor)
-        The resized tensor with shape (B, *im_size)
-    """
-
-    n_spatial = len(im_size)
-    if n_spatial == 3 and method == "bicubic":
-        warn(
-            "Bicubic interpolation is not supported for 3D data, using bilinear instead."
-        )
-        method = "bilinear"
-
-    grd = 2 * gen_grd(im_size, balanced=True, device=x.device).flip(-1)
-    grd = grd[None].repeat_interleave(x.shape[0], dim=0)
-
-    def gs(x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.grid_sample(
-            x.unsqueeze(1), grd, align_corners=True, mode=method
-        ).squeeze(1)
-
-    if torch.is_complex(x):
-        x = gs(x.real) + 1j * gs(x.imag)
-    else:
-        x = gs(x)
-
-    return x
-
-
 def spatial_resize(
     x: torch.Tensor,
     im_size: tuple,
-    method: RESIZE_METHODS = "bilinear",
+    method: RESIZE_METHODS = "poly",
     window: Optional[WINDOW_METHODS] = None,
+    order: int = 3,
+    mag_phase: bool = False,
 ) -> torch.Tensor:
     """
     Resize a spatial tensor to a new spatial size.
@@ -531,8 +226,15 @@ def spatial_resize(
             - 'bicubic': cubic interpolation
             - 'nearest': nearest sample interpolation
             - 'fourier': fourier interpolation
+            - 'poly': polynomial interpolation
     window : (Optional[str])
         The window to apply to the fourier interpolation
+    order : (Optional[int])
+        The order of the polynomial interpolation,
+        if method = poly.
+    mag_phase : (bool)
+        Whether to resize the magnitude and phase separately,
+        if complex. Default is real/imag.
 
     Returns:
     --------
@@ -567,9 +269,28 @@ def spatial_resize(
         x = x.reshape((-1, *orig_im_size))
 
     if method == "fourier":
+        assert not mag_phase, "Fourier resize does not support mag_phase"
         x = _fourier_resize(x, im_size, window)
+    elif method == "poly":
+        if order == 3 and TRITON_AVAILABLE:
+            resize_poly = lambda value: _spatial_resize_poly_cubic(value, im_size)
+        else:
+            resize_poly = lambda value: _spatial_resize_poly_lagrange(
+                value, im_size, order=order
+            )
+        if mag_phase:
+            xabs = resize_poly(x.abs())
+            xarg = resize_poly(x.angle())
+            x = xabs * torch.exp(1j * xarg)
+        else:
+            x = resize_poly(x)
     elif method in SPATIAL_RESIZE_METHODS.__args__:
-        x = _spatial_resize(x, im_size, method=method)
+        if mag_phase:
+            xabs = _spatial_resize(x.abs(), im_size, method=method)
+            xarg = _spatial_resize(x.angle(), im_size, method=method)
+            x = xabs * torch.exp(1j * xarg)
+        else:
+            x = _spatial_resize(x, im_size, method=method)
     else:
         raise ValueError(
             f"Unknown resize method: {method}. Must be one of {RESIZE_METHODS}."
