@@ -1,12 +1,9 @@
 from math import sqrt
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple
 from warnings import warn
 
-import numpy as np
 import torch
-from scipy.ndimage import gaussian_filter, median_filter
 from scipy.signal import windows
-from tqdm import tqdm
 
 SPATIAL_RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest"]
 RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest", "fourier", "poly"]

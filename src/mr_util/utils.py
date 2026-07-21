@@ -130,7 +130,11 @@ def resize(input: torch.Tensor, oshape: Tuple[int, ...], padval=None) -> torch.T
 
 
 def fft(
-    x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True
+    x: torch.Tensor, 
+    o_im_shape: Optional[Tuple[int, ...]] = None, 
+    dim: Optional[Union[int, Tuple[int, ...]]] = None, 
+    center: bool = True, 
+    norm = "ortho",
 ) -> torch.Tensor:
     """
     Compute the cartesian FFT of image data with shape (..., im_shape)
@@ -141,7 +145,9 @@ def fft(
     x : torch.Tensor
         Input image data with shape (..., in_img_shape)
     o_im_shape : tuple
-        Desired output image shape
+        Desired output image shape along FFT dimensions
+    dim : tuple, optional
+        The dimensions to perform the FFT on, if None, uses last dims
     center : bool, optional
         Whether to center the k-space, by default True
 
@@ -151,23 +157,39 @@ def fft(
         Output k-space data with shape (..., o_im_shape)
     """
 
-    fftdims = tuple(range(-len(o_im_shape), 0))
+    if isinstance(dim, int):
+        dim = (dim,)
+    if isinstance(o_im_shape, int):
+        o_im_shape = (o_im_shape,)
 
-    newshape = (*x.shape[: -len(o_im_shape)], *o_im_shape)
-
+    if dim is None and o_im_shape is not None:
+        # assume last dims
+        dim = tuple(range(-len(o_im_shape), 0))
+    
+    if o_im_shape is not None:
+        # resize as needed
+        newshape = list(tuple(x.shape))
+        for d in dim:
+            newshape[d] = o_im_shape[d]
+        x = resize(x, tuple(newshape))
+    
     if center:
-        x = resize(x, newshape)
-        x = torch.fft.ifftshift(x, dim=fftdims)
-        x = torch.fft.fftn(x, s=o_im_shape, dim=fftdims, norm="ortho")
-        x = torch.fft.fftshift(x, dim=fftdims)
+        x = torch.fft.ifftshift(x, dim=dim)
+        x = torch.fft.fftn(x, dim=dim, norm=norm)
+        x = torch.fft.fftshift(x, dim=dim)
     else:
-        x = torch.fft.fftn(x, s=o_im_shape, dim=fftdims, norm="ortho")
+        x = torch.fft.fftn(x, dim=dim, norm=norm)
+
 
     return x
 
 
 def ifft(
-    x: torch.Tensor, o_im_shape: Tuple[int, ...], center: bool = True
+    x: torch.Tensor, 
+    o_im_shape: Optional[Tuple[int, ...]] = None, 
+    dim: Optional[Union[int, Tuple[int, ...]]] = None, 
+    center: bool = True, 
+    norm = "ortho",
 ) -> torch.Tensor:
     """
     Compute the inverse cartesian FFT of k-space data with shape (..., im_shape)
@@ -178,7 +200,9 @@ def ifft(
     x : torch.Tensor
         Input k-space data with shape (..., in_img_shape)
     o_im_shape : tuple
-        Desired output image shape
+        Desired output image shape along FFT dimensions
+    dim : tuple, optional
+        The dimensions to perform the FFT on, if None, uses last dims
     center : bool, optional
         Whether to center the k-space, by default True
 
@@ -188,17 +212,28 @@ def ifft(
         Output image data with shape (..., o_im_shape)
     """
 
-    fftdims = tuple(range(-len(o_im_shape), 0))
+    if isinstance(dim, int):
+        dim = (dim,)
+    if isinstance(o_im_shape, int):
+        o_im_shape = (o_im_shape,)
 
-    newshape = (*x.shape[: -len(o_im_shape)], *o_im_shape)
+    if dim is None and o_im_shape is not None:
+        # assume last dims
+        dim = tuple(range(-len(o_im_shape), 0))
+    
+    if o_im_shape is not None:
+        # resize as needed
+        newshape = list(tuple(x.shape))
+        for d in dim:
+            newshape[d] = o_im_shape[d]
+        x = resize(x, tuple(newshape))
 
     if center:
-        x = resize(x, newshape)
-        x = torch.fft.ifftshift(x, dim=fftdims)
-        x = torch.fft.ifftn(x, s=o_im_shape, dim=fftdims, norm="ortho")
-        x = torch.fft.fftshift(x, dim=fftdims)
+        x = torch.fft.ifftshift(x, dim=dim)
+        x = torch.fft.ifftn(x, dim=dim, norm=norm)
+        x = torch.fft.fftshift(x, dim=dim)
     else:
-        x = torch.fft.ifftn(x, s=o_im_shape, dim=fftdims, norm="ortho")
+        x = torch.fft.ifftn(x, dim=dim, norm=norm)
 
     return x
 
