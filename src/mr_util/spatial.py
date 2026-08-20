@@ -1,9 +1,7 @@
-from math import sqrt
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional
 from warnings import warn
 
 import torch
-from scipy.signal import windows
 
 SPATIAL_RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest"]
 RESIZE_METHODS = Literal["bilinear", "bicubic", "nearest", "fourier", "poly"]
@@ -101,68 +99,7 @@ def hilbert(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return x
 
 
-def nd_windowed_filter(
-    w_shape: Tuple[int, ...],
-    window: WINDOW_METHODS = "hann",
-    oshape: Optional[Tuple[int, ...]] = None,
-) -> torch.Tensor:
-    """
-    Get n-dimensional windowed fourier filter for data with shape im_shape, where the window is defined by w_shape.
-
-    Returns window of shape w_shape, or a window padded to oshape if provided.
-    """
-    if isinstance(w_shape, int):
-        w_shape = (w_shape,)
-    if isinstance(oshape, int):
-        oshape = (oshape,)
-
-    if oshape is None:
-        oshape = w_shape
-    else:
-        assert len(oshape) == len(
-            w_shape
-        ), "Output shape must have same number of dimensions as window shape."
-        assert all(
-            [oshape[i] >= w_shape[i] for i in range(len(oshape))]
-        ), "Output shape must be larger than window shape."
-
-    d = len(w_shape)
-    assert d <= 3, "Only 1, 2, or 3 dimensions supported."
-
-    if window == "hamming":
-        wfunc = lambda x: windows.hamming(x)
-    elif window == "kaiser":
-        wfunc = lambda x: windows.kaiser(x, beta=14)
-    elif window == "gaussian":
-        wfunc = lambda x: windows.gaussian(x, std=sqrt(max(w_shape)))
-    elif window == "tukey":
-        wfunc = lambda x: windows.tukey(x, alpha=0.5)
-    elif window == "hann":
-        wfunc = lambda x: windows.hann(x)
-    elif window == "boxcar":
-        wfunc = lambda x: windows.boxcar(x)
-    else:
-        raise ValueError(
-            f"Unknown window type: {window}. Must be one of {WINDOW_METHODS.__args__}."
-        )
-
-    # form n-d window
-    if d == 1:
-        out = wfunc(w_shape[0])
-    elif d == 2:
-        out = wfunc(w_shape[0])[:, None] @ wfunc(w_shape[1])[None, :]
-    elif d == 3:
-        out_2d = wfunc(w_shape[0])[:, None] @ wfunc(w_shape[1])[None, :]
-        out = out_2d[:, :, None] * wfunc(w_shape[2])[None, None, :]
-
-    # zero pad window to oshape
-    if oshape != w_shape:
-        out = resize(out, oshape)
-
-    return out
-
-
-def rotation_matrix_3d(thetas: torch.Tensor) -> torch.Tensor:
+def rotation_matrix_3d(thetas: torch.Tensor, rot_order: str = "xyz") -> torch.Tensor:
     """
     From Daniel Abraham `mr_recon` 
 
@@ -172,7 +109,10 @@ def rotation_matrix_3d(thetas: torch.Tensor) -> torch.Tensor:
     -----------
     thetas : torch.Tensor
         angle of rotation in radians with shape (..., 3)
-    
+    rot_order : str
+        order of rotations, string ordering of x, y, z
+        Default is "xyz".
+
     Returns:
     --------
     R : torch.Tensor
@@ -191,7 +131,14 @@ def rotation_matrix_3d(thetas: torch.Tensor) -> torch.Tensor:
                                        device=thetas.device, 
                                        dtype=thetas.dtype)[tup], 
                           thetas[..., 2])
-    return Rxs @ Rys @ Rzs
+
+    rots = {
+        "x": Rxs,
+        "y": Rys,
+        "z": Rzs,
+    }
+
+    return rots[rot_order[0]] @ rots[rot_order[1]] @ rots[rot_order[2]]
 
 
 def rotation_matrix(axis: torch.Tensor, 
@@ -276,67 +223,6 @@ def gen_grd(
     return grd.type(torch.float32)
 
 
-
-def _fourier_resize(
-    x: torch.Tensor, new_shape: Tuple[int, ...], window: Optional[WINDOW_METHODS] = None
-) -> torch.Tensor:
-    """
-    Take an image and reshape it to new_shape using fourier padding
-
-    Parameters:
-    -----------
-    x : torch.Tensor
-        The input tensor with shape (..., *inp_im_size)
-    new_shape : Tuple[int, ...]
-        The size of the image to resize to
-    window : Optional[WINDOW_METHODS]
-        The window to apply to the fourier interpolation. Options:
-            - 'boxcar': boxcar window (default)
-            - 'hamming': hamming window
-            - 'hann': hann window
-            - 'blackman': blackman window
-            - 'kaiser': kaiser window
-
-    Returns:
-    --------
-    x : torch.Tensor
-        The resized tensor with shape (..., *new_shape)
-    """
-
-    isComplex = False
-
-    if window is None:
-        window = DEFAULT_WINDOW
-
-    if torch.is_complex(x):
-        isComplex = True
-
-    ndim = len(new_shape)
-    fft_shape = x.shape[-ndim:]
-    abs_max = x.abs().max()
-
-    x = fft(x, fft_shape)
-
-    if window != "boxcar":
-        wind = (
-            torch.from_numpy(nd_windowed_filter(fft_shape, window=window))
-            .to(x.device)
-            .to(x.dtype)
-        )
-        for _ in range(x.ndim - wind.ndim):
-            wind = wind[None, ...]
-        x = x * wind
-
-    x = ifft(x, new_shape)
-
-    if not isComplex:
-        x = x.real
-
-    x = x / x.abs().max() * abs_max
-
-    return x
-
-
 def _spatial_resize(
     x: torch.Tensor,
     im_size: tuple,
@@ -386,10 +272,42 @@ def _spatial_resize(
     return x
 
 
+def _poly_resize_coords(
+    in_size: int,
+    out_size: int,
+    dtype: torch.dtype,
+    device: Optional[torch.device] = None,
+    preserve_dc_position: bool = False,
+) -> torch.Tensor:
+    """
+    Output-index -> input-coordinate map shared by the poly resize interpolants.
+
+    preserve_dc_position=False (default, current behavior): align-corners, pins
+    array endpoints (index 0 <-> 0, index N-1 <-> N-1). This only coincides with
+    the N//2 DC/FFT-center convention used elsewhere in this codebase (gen_grd,
+    fft, ifft, resize) when BOTH in_size and out_size are odd -- for any resize
+    where one or both sizes are even, this introduces a sub-pixel offset between
+    the resized array's DC pixel and the N//2 convention.
+
+    preserve_dc_position=True: maps output index out_size//2 to input index
+    in_size//2 exactly (scaled by in_size/out_size around that point), matching
+    the DC convention used everywhere else, at the cost of no longer pinning the
+    array endpoints (coordinates can fall slightly outside [0, in_size-1] near
+    the edges; callers must handle/clamp that).
+    """
+    if out_size == 1:
+        return torch.zeros(1, device=device, dtype=dtype)
+    j = torch.arange(out_size, device=device, dtype=dtype)
+    if preserve_dc_position:
+        return (j - out_size // 2) * (in_size / out_size) + (in_size // 2)
+    return j * ((in_size - 1) / (out_size - 1))
+
+
 def _spatial_resize_poly_lagrange(
     x: torch.Tensor,
     im_size: tuple,
     order: Optional[int] = 3,
+    preserve_dc_position: bool = False,
 ) -> torch.Tensor:
     """Resize a spatial tensor to a new spatial size using Lagrange-weighted polynomial interpolation."""
     if order is None:
@@ -414,11 +332,9 @@ def _spatial_resize_poly_lagrange(
             torch.float64 if x.dtype in (torch.float64, torch.complex128)
             else torch.float32
         )
-        if out_size == 1:
-            coords = torch.zeros(1, device=x.device, dtype=coord_dtype)
-        else:
-            coords = torch.arange(out_size, device=x.device, dtype=coord_dtype)
-            coords.mul_((in_size - 1) / (out_size - 1))
+        coords = _poly_resize_coords(
+            in_size, out_size, coord_dtype, x.device, preserve_dc_position
+        )
 
         if degree == 0:
             indices = torch.floor(coords + 0.5).to(torch.long)
@@ -509,6 +425,7 @@ def _cubic_spline_filter_axis(x: torch.Tensor, dim: int) -> torch.Tensor:
 def _spatial_resize_poly_cubic(
     x: torch.Tensor,
     im_size: tuple,
+    preserve_dc_position: bool = False,
 ) -> torch.Tensor:
     """Resize with the prefiltered cubic B-spline used by map_coordinates."""
     if len(im_size) != x.ndim - 1:
@@ -537,16 +454,19 @@ def _spatial_resize_poly_cubic(
         else torch.float32
     )
     for dim, (in_size, out_size) in enumerate(zip(inp_size, im_size), start=1):
-        if out_size == 1:
-            coords = torch.zeros(1, device=x.device, dtype=coord_dtype)
-        else:
-            coords = torch.arange(out_size, device=x.device, dtype=coord_dtype)
-            coords.mul_((in_size - 1) / (out_size - 1))
+        coords = _poly_resize_coords(
+            in_size, out_size, coord_dtype, x.device, preserve_dc_position
+        )
         coords.add_(pad)
 
         base = torch.floor(coords).to(torch.long)
         t = coords - base.to(coord_dtype)
-        nodes = base[:, None] + torch.arange(-1, 3, device=x.device)[None]
+        # preserve_dc_position maps don't pin array endpoints, so coordinates can
+        # fall slightly outside the padded input near the edges; clamp node
+        # indices into the valid (padded) range rather than index out of bounds.
+        nodes = (base[:, None] + torch.arange(-1, 3, device=x.device)[None]).clamp(
+            0, x.shape[dim] - 1
+        )
         weights = torch.stack(
             (
                 (1.0 - t) ** 3,

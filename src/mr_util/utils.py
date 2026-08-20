@@ -16,13 +16,11 @@ from .spatial import (
     WINDOW_METHODS,
     DEFAULT_WINDOW,
     _cubic_spline_prefilter_kernel,
-    _fourier_resize,
     _spatial_resize,
     _spatial_resize_poly_lagrange,
     _spatial_resize_poly_cubic,
     _cubic_spline_filter_axis,
     hilbert,
-    nd_windowed_filter,
     rotation_matrix_3d,
     rotation_matrix,
     gen_grd,
@@ -238,6 +236,127 @@ def ifft(
     return x
 
 
+def nd_windowed_filter(
+    w_shape: Tuple[int, ...],
+    window: WINDOW_METHODS = "hann",
+    oshape: Optional[Tuple[int, ...]] = None,
+) -> torch.Tensor:
+    """
+    Get n-dimensional windowed fourier filter for data with shape im_shape, where the window is defined by w_shape.
+
+    Returns window of shape w_shape, or a window padded to oshape if provided.
+    """
+    if isinstance(w_shape, int):
+        w_shape = (w_shape,)
+    if isinstance(oshape, int):
+        oshape = (oshape,)
+
+    if oshape is None:
+        oshape = w_shape
+    else:
+        assert len(oshape) == len(
+            w_shape
+        ), "Output shape must have same number of dimensions as window shape."
+        assert all(
+            [oshape[i] >= w_shape[i] for i in range(len(oshape))]
+        ), "Output shape must be larger than window shape."
+
+    d = len(w_shape)
+    assert d <= 3, "Only 1, 2, or 3 dimensions supported."
+
+    if window == "hamming":
+        wfunc = lambda x: windows.hamming(x)
+    elif window == "kaiser":
+        wfunc = lambda x: windows.kaiser(x, beta=14)
+    elif window == "gaussian":
+        wfunc = lambda x: windows.gaussian(x, std=sqrt(max(w_shape)))
+    elif window == "tukey":
+        wfunc = lambda x: windows.tukey(x, alpha=0.5)
+    elif window == "hann":
+        wfunc = lambda x: windows.hann(x)
+    elif window == "boxcar":
+        wfunc = lambda x: windows.boxcar(x)
+    else:
+        raise ValueError(
+            f"Unknown window type: {window}. Must be one of {WINDOW_METHODS.__args__}."
+        )
+
+    # form n-d window
+    if d == 1:
+        out = wfunc(w_shape[0])
+    elif d == 2:
+        out = wfunc(w_shape[0])[:, None] @ wfunc(w_shape[1])[None, :]
+    elif d == 3:
+        out_2d = wfunc(w_shape[0])[:, None] @ wfunc(w_shape[1])[None, :]
+        out = out_2d[:, :, None] * wfunc(w_shape[2])[None, None, :]
+
+    # zero pad window to oshape
+    if oshape != w_shape:
+        out = resize(out, oshape)
+
+    return out
+
+
+def _fourier_resize(
+    x: torch.Tensor, new_shape: Tuple[int, ...], window: Optional[WINDOW_METHODS] = None
+) -> torch.Tensor:
+    """
+    Take an image and reshape it to new_shape using fourier padding
+
+    Parameters:
+    -----------
+    x : torch.Tensor
+        The input tensor with shape (..., *inp_im_size)
+    new_shape : Tuple[int, ...]
+        The size of the image to resize to
+    window : Optional[WINDOW_METHODS]
+        The window to apply to the fourier interpolation. Options:
+            - 'boxcar': boxcar window (default)
+            - 'hamming': hamming window
+            - 'hann': hann window
+            - 'blackman': blackman window
+            - 'kaiser': kaiser window
+
+    Returns:
+    --------
+    x : torch.Tensor
+        The resized tensor with shape (..., *new_shape)
+    """
+
+    isComplex = False
+
+    if window is None:
+        window = DEFAULT_WINDOW
+
+    if torch.is_complex(x):
+        isComplex = True
+
+    ndim = len(new_shape)
+    fft_shape = x.shape[-ndim:]
+    abs_max = x.abs().max()
+
+    x = fft(x, fft_shape)
+
+    if window != "boxcar":
+        wind = (
+            torch.from_numpy(nd_windowed_filter(fft_shape, window=window))
+            .to(x.device)
+            .to(x.dtype)
+        )
+        for _ in range(x.ndim - wind.ndim):
+            wind = wind[None, ...]
+        x = x * wind
+
+    x = ifft(x, new_shape)
+
+    if not isComplex:
+        x = x.real
+
+    x = x / x.abs().max() * abs_max
+
+    return x
+
+
 def spatial_resize(
     x: torch.Tensor,
     im_size: tuple,
@@ -245,6 +364,7 @@ def spatial_resize(
     window: Optional[WINDOW_METHODS] = None,
     order: int = 3,
     mag_phase: bool = False,
+    preserve_dc_position: bool = True,
 ) -> torch.Tensor:
     """
     Resize a spatial tensor to a new spatial size.
@@ -270,12 +390,33 @@ def spatial_resize(
     mag_phase : (bool)
         Whether to resize the magnitude and phase separately,
         if complex. Default is real/imag.
+    preserve_dc_position : (bool)
+        Only supported for method="poly". Default False keeps the existing
+        align-corners behavior (pins array endpoints 0<->0, N-1<->N-1), which
+        only coincides with the N//2 DC/FFT-center convention used elsewhere
+        in this codebase (gen_grd, fft, ifft, resize) when both the input and
+        output sizes are odd -- any resize involving an even size introduces a
+        sub-pixel offset between the resized array's center and that convention.
+        If True, the resize instead maps output index im_size[i]//2 to input
+        index inp_im_size[i]//2 exactly, matching the N//2 convention, at the
+        cost of no longer pinning the array endpoints. Ignored (with a warning)
+        for any other method, since those already follow the N//2 convention
+        (bilinear/bicubic/nearest via grid_sample's own centering, fourier via
+        the same zero-pad/crop resize() used by fft/ifft).
 
     Returns:
     --------
     x : (torch.Tensor)
         The resized tensor with shape (..., *im_size)
     """
+
+    if preserve_dc_position and method != "poly":
+        warn(
+            f"preserve_dc_position=True is only supported for method='poly' "
+            f"(got method={method!r}); ignoring and proceeding with "
+            f"preserve_dc_position=False."
+        )
+        preserve_dc_position = False
 
     inp_im_size = x.shape[-len(im_size) :]
     if inp_im_size == im_size:
@@ -308,10 +449,12 @@ def spatial_resize(
         x = _fourier_resize(x, im_size, window)
     elif method == "poly":
         if order == 3 and TRITON_AVAILABLE:
-            resize_poly = lambda value: _spatial_resize_poly_cubic(value, im_size)
+            resize_poly = lambda value: _spatial_resize_poly_cubic(
+                value, im_size, preserve_dc_position=preserve_dc_position
+            )
         else:
             resize_poly = lambda value: _spatial_resize_poly_lagrange(
-                value, im_size, order=order
+                value, im_size, order=order, preserve_dc_position=preserve_dc_position
             )
         if mag_phase:
             xabs = resize_poly(x.abs())
